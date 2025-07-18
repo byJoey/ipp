@@ -12,12 +12,13 @@ LOG_FILE="/var/log/3proxy.log"
 check_and_install_dependencies() {
     echo "-->正在检查脚本运行所需的命令..."
     local missing_packages=()
-    local required_commands=("ip" "wget" "curl" "make")
+    # 增加对 openssl 的依赖检查
     local command_to_package_map=(
         "ip:iproute2"
         "wget:wget"
         "curl:curl"
         "make:build-essential"
+        "openssl:openssl"
     )
 
     for item in "${command_to_package_map[@]}"; do
@@ -25,7 +26,6 @@ check_and_install_dependencies() {
         PKG="${item#*:}"
         if ! command -v "$CMD" &> /dev/null; then
             echo "    - 命令 '$CMD' 未找到, 需要安装软件包 '$PKG'"
-            # Add package to the list if not already there
             if [[ ! " ${missing_packages[@]} " =~ " ${PKG} " ]]; then
                 missing_packages+=("$PKG")
             fi
@@ -34,10 +34,9 @@ check_and_install_dependencies() {
 
     if [ ${#missing_packages[@]} -gt 0 ]; then
         echo "-->检测到缺失的依赖, 准备自动安装..."
-        # Check for root privileges
         if [ "$EUID" -ne 0 ]; then
-          echo "错误: 请使用 sudo 权限运行此脚本以安装依赖。"
-          exit 1
+            echo "错误: 请使用 sudo 权限运行此脚本以安装依赖。"
+            exit 1
         fi
         
         sudo apt-get update -y
@@ -53,7 +52,7 @@ check_and_install_dependencies() {
 show_menu() {
     clear
     echo "=========================================="
-    echo "     多IP代理服务 - acck擦屁股本 "
+    echo "      多IP代理服务 - acck擦屁股本 (密码增强版)"
     echo "=========================================="
     echo " 配置文件位于: ${CONFIG_FILE}"
     echo "------------------------------------------"
@@ -84,20 +83,22 @@ show_proxy_info() {
     local PORT=$(get_port_from_config)
     local IP_LIST_FROM_FILE=($(get_ips_from_config))
     local USER_LINE=$(grep '^users ' "${CONFIG_FILE}" || echo "")
-    local AUTH_METHOD="无认证"
-    local USER=""
-    local PASS=""
-
-    if [ -n "$USER_LINE" ]; then
-        AUTH_METHOD="用户名/密码"
-        USER=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f1)
-        PASS=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f3)
+    
+    # 强制认证后，必须要有用户信息
+    if [ -z "$USER_LINE" ]; then
+        echo "错误：配置文件不完整或认证信息丢失！"
+        return
     fi
+    
+    local AUTH_METHOD="用户名/密码"
+    local USER=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f1)
+    local PASS=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f3)
 
     echo "配置文件: ${CONFIG_FILE}"
     echo "代理端口: ${PORT}"
     echo "认证方式: ${AUTH_METHOD}"
-    if [ -n "$USER" ]; then echo "用户名:   ${USER}"; echo "密码:     ${PASS}"; fi
+    echo "用户名:   ${USER}"
+    echo "密码:     ${PASS}"
     
     echo ""
     echo "--- 可用代理IP列表 (共 ${#IP_LIST_FROM_FILE[@]} 个) ---"
@@ -107,17 +108,29 @@ show_proxy_info() {
 
 get_server_ips() { ip -4 addr show | grep -oP 'inet \K[\d.]+' | grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)'; }
 
+# ---> 新功能: 自动生成密码 <---
+generate_random_password() {
+    # 使用openssl生成一个12位的强密码
+    openssl rand -base64 12
+}
+
 get_user_config() {
     read -p "请输入代理端口 (留空则默认为 8888): " PORT
     PORT=${PORT:-8888}
-    read -p "请输入用户名 (重要: 留空则为无认证模式): " USER
-    if [[ -n "$USER" ]]; then
-        read -s -p "请输入密码 (输入时不可见): " PASS
-        echo
-        if [[ -z "$PASS" ]]; then echo "错误：密码不能为空。" && sleep 2 && return 1; fi
-        AUTH_TYPE="strong"
-    else
-        AUTH_TYPE="none"
+    
+    # 用户名现在是必须的
+    read -p "请输入用户名 (必须, 留空则默认为 admin): " USER
+    USER=${USER:-admin}
+    
+    # 密码留空时自动生成
+    read -s -p "请输入密码 (输入时不可见, 留空则自动生成): " PASS
+    echo
+
+    if [[ -z "$PASS" ]]; then
+        PASS=$(generate_random_password)
+        echo "--> 注意: 未输入密码，已自动为您生成密码。"
+        echo "--> 您的密码是: ${PASS}"
+        sleep 1
     fi
     return 0
 }
@@ -135,11 +148,13 @@ nserver 8.8.8.8
 nserver 1.1.1.1
 log ${LOG_FILE} D
 EOC
-    if [ "$AUTH_TYPE" == "strong" ]; then
-        echo "auth strong"; echo "users ${USER}:CL:${PASS}"
-    fi
+    # 总是添加强认证配置
+    echo "auth strong"
+    echo "users ${USER}:CL:${PASS}"
+    
+    # 总是生成需要认证的代理
     for IP in "${IP_LIST[@]}"; do
-        if [ "$AUTH_TYPE" == "strong" ]; then echo "socks -p${PORT} -i${IP} -e${IP}"; else echo "socks -a -p${PORT} -i${IP} -e${IP}"; fi
+        echo "socks -p${PORT} -i${IP} -e${IP}"
     done
     ) | sudo tee "${CONFIG_FILE}" > /dev/null
     echo "--> 配置文件已写入 ${CONFIG_FILE}"
@@ -187,16 +202,15 @@ do_test_proxies() {
     local PORT=$(get_port_from_config)
     local IP_LIST_FROM_FILE=($(get_ips_from_config))
     local USER_LINE=$(grep '^users ' "${CONFIG_FILE}" || echo "")
-    local CURL_AUTH_FLAG=""
 
-    if [ -n "$USER_LINE" ]; then
-        local USER=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f1)
-        local PASS=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f3)
-        CURL_AUTH_FLAG="--proxy-user ${USER}:${PASS}"
-        echo "检测到认证配置，将使用用户 '${USER}' 进行测试。"
-    else
-        echo "无认证模式，将进行匿名测试。"
+    if [ -z "$USER_LINE" ]; then
+        echo "错误：配置文件损坏或认证信息丢失！" && return
     fi
+    
+    local USER=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f1)
+    local PASS=$(echo "$USER_LINE" | cut -d' ' -f2 | cut -d':' -f3)
+    local CURL_AUTH_FLAG="--proxy-user ${USER}:${PASS}"
+    echo "将使用用户 '${USER}' 进行测试。"
 
     if [ ${#IP_LIST_FROM_FILE[@]} -eq 0 ]; then echo "配置文件中未找到可测试的代理。" && sleep 2 && return; fi
     
