@@ -1,7 +1,5 @@
 #!/bin/bash
 
-
-
 set -e
 
 # 颜色定义
@@ -271,13 +269,13 @@ add_shadowsocks() {
     "password": "$password",
     "network": "tcp,udp"
   },
-  "tag": "ss-$port"
+  "tag": "ss-$listen_ip-$port"
 }
 EOF
 )
 
     jq ".inbounds += [$inbound]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
-    add_routing "ss-$port" "$outbound_tag"
+    add_routing "ss-$listen_ip-$port" "$outbound_tag"
 
     log_info "Shadowsocks已添加: $listen_ip:$port"
 }
@@ -307,13 +305,13 @@ add_socks5() {
     ],
     "udp": true
   },
-  "tag": "socks-$port"
+  "tag": "socks-$listen_ip-$port"
 }
 EOF
 )
 
     jq ".inbounds += [$inbound]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
-    add_routing "socks-$port" "$outbound_tag"
+    add_routing "socks-$listen_ip-$port" "$outbound_tag"
 
     log_info "SOCKS5已添加: $listen_ip:$port"
 }
@@ -448,16 +446,25 @@ add_single_proxy() {
 
 # 批量添加代理
 batch_add_proxies() {
-    echo -e "${BLUE}=== 批量添加代理 ===${NC}"
+    echo -e "${BLUE}=== 批量添加代理 (增强版) ===${NC}"
 
     read -p "代理类型 (1-SS, 2-SOCKS5): " proxy_type
-    read -p "生成数量: " count
-
-    if ! echo "$count" | grep -q '^[0-9]\+$' || [ "$count" -lt 1 ]; then
-        log_error "无效的数量。"
+    if [ "$proxy_type" != "1" ] && [ "$proxy_type" != "2" ]; then
+        log_error "无效的代理类型。"
         return
     fi
+    
+    # 获取统一配置
+    read -p "请输入统一监听端口 (留空则为每个代理随机生成): " unified_port
+    local unified_user=""
+    local unified_pass=""
+    if [ "$proxy_type" = "2" ]; then # SOCKS5
+        read -p "请输入统一用户名 (留空则为每个代理随机生成): " unified_user
+    fi
+    # SS 和 SOCKS5 都有密码
+    read -p "请输入统一密码 (留空则为每个代理随机生成): " unified_pass
 
+    # 解析3proxy配置
     local proxy_ips=()
     local proxy_ports=()
     local proxy_user=""
@@ -466,17 +473,36 @@ batch_add_proxies() {
         return
     fi
     
-    if [ ${#proxy_ips[@]} -eq 0 ]; then
+    local num_available_ips=${#proxy_ips[@]}
+    if [ "$num_available_ips" -eq 0 ]; then
         log_error "未从配置文件中找到任何可用的3proxy代理。"
         return
     fi
 
-    echo -e "${BLUE}监听IP配置:${NC}"
-    echo "[1] 每个代理监听其对应的出站IP"
-    echo "[2] 所有代理都监听 0.0.0.0"
-    echo "[3] 选择一个固定的IP"
-
-    read -p "请输入选项: " listen_method
+    # 根据是否使用统一端口，决定生成数量和监听模式
+    local count
+    local listen_method
+    if [ -n "$unified_port" ]; then
+        log_warn "检测到统一端口设置，监听模式将固定为[每个代理监听其对应的出站IP]。"
+        listen_method="1"
+        read -p "您最多可创建 ${num_available_ips} 个代理, 请输入生成数量: " count
+        if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ] || [ "$count" -gt "$num_available_ips" ]; then
+            log_error "无效数量。数量必须是 1 到 ${num_available_ips} 之间的数字。"
+            return
+        fi
+    else
+        read -p "请输入生成数量: " count
+        if ! echo "$count" | grep -q '^[0-9]\+$' || [ "$count" -lt 1 ]; then
+            log_error "无效的数量。"
+            return
+        fi
+        
+        echo -e "${BLUE}监听IP配置:${NC}"
+        echo "[1] 每个代理监听其对应的出站IP"
+        echo "[2] 所有代理都监听 0.0.0.0"
+        echo "[3] 选择一个固定的IP"
+        read -p "请输入选项: " listen_method
+    fi
 
     local fixed_ip=""
     if [ "$listen_method" = "3" ]; then
@@ -487,14 +513,14 @@ batch_add_proxies() {
     fi
 
     log_info "开始批量生成 $count 个代理..."
-
     local output_file="/tmp/xray_links_$(date +%Y%m%d_%H%M%S).txt"
     echo "# Xray代理链接 - $(date)" > "$output_file"
     echo "" >> "$output_file"
 
     for i in $(seq 1 $count); do
-        # 轮询选择IP
-        local idx=$(((i-1) % ${#proxy_ips[@]}))
+        # 确定IP索引
+        local idx=$(((i-1) % num_available_ips))
+        
         local proxy_ip="${proxy_ips[$idx]}"
         local proxy_port="${proxy_ports[$idx]}"
         local outbound_tag="3proxy-$proxy_ip-$proxy_port"
@@ -510,26 +536,31 @@ batch_add_proxies() {
         # 添加出站
         add_outbound_and_routing "$outbound_tag" "$proxy_ip" "$proxy_port" "$proxy_user" "$proxy_pass"
 
-        local port=$(get_next_port)
+        # 确定端口
+        local port
+        if [ -n "$unified_port" ]; then port="$unified_port"; else port=$(get_next_port); fi
 
         if [ "$proxy_type" = "1" ]; then
             # Shadowsocks
-            local password=$(generate_password)
+            local password
+            if [ -n "$unified_pass" ]; then password="$unified_pass"; else password=$(generate_password); fi
             local method="aes-256-gcm"
-
+            
             add_shadowsocks "$listen_ip" "$port" "$password" "$method" "$outbound_tag"
-
+            
             local link="ss://$(echo -n "$method:$password" | base64)@$listen_ip:$port"
             echo "$link  # 出站IP: $proxy_ip" >> "$output_file"
             echo "$link  # 出站IP: $proxy_ip"
 
         elif [ "$proxy_type" = "2" ]; then
             # SOCKS5
-            local username="user_$i"
-            local password=$(generate_password)
+            local username
+            local password
+            if [ -n "$unified_user" ]; then username="$unified_user"; else username="user_$i"; fi
+            if [ -n "$unified_pass" ]; then password="$unified_pass"; else password=$(generate_password); fi
 
             add_socks5 "$listen_ip" "$port" "$username" "$password" "$outbound_tag"
-
+            
             local link="socks5://$username:$password@$listen_ip:$port"
             echo "$link  # 出站IP: $proxy_ip" >> "$output_file"
             echo "$link  # 出站IP: $proxy_ip"
@@ -637,7 +668,7 @@ install_xray() {
 main_menu() {
     while true; do
         echo
-        echo -e "${BLUE}=== Xray代理管理脚本 (SS/SOCKS5) v5.2 ===${NC}"
+        echo -e "${BLUE}=== Xray代理管理脚本 (SS/SOCKS5) v5.3 ===${NC}"
         echo "[1] 添加单个代理"
         echo "[2] 批量添加代理"
         echo "[3] 列出现有代理和出站"
