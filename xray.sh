@@ -62,12 +62,10 @@ parse_3proxy_config() {
 
     local auth_found=false
     while IFS= read -r line; do
-        # 忽略注释和空行
         case "$line" in
             \#*|"") continue ;;
         esac
 
-        # 解析SOCKS代理行
         if echo "$line" | grep -q "^socks"; then
             local ip=$(echo "$line" | grep -o '\-i[0-9.]*' | sed 's/-i//')
             local port=$(echo "$line" | grep -o '\-p[0-9]*' | sed 's/-p//')
@@ -76,7 +74,6 @@ parse_3proxy_config() {
                 proxy_ips_ref+=("$ip")
                 proxy_ports_ref+=("$port")
             fi
-        # 解析用户认证行 (只取第一个)
         elif [[ "$line" == "users "* ]] && [ -z "$user_ref" ]; then
             local user_line_creds=$(echo "$line" | awk '{print $2}')
             user_ref=$(echo "$user_line_creds" | cut -d: -f1)
@@ -259,6 +256,7 @@ add_shadowsocks() {
 
     backup_config "$XRAY_CONFIG"
 
+    local inbound_tag="ss-$listen_ip-$port"
     local inbound=$(cat <<EOF
 {
   "port": $port,
@@ -269,13 +267,13 @@ add_shadowsocks() {
     "password": "$password",
     "network": "tcp,udp"
   },
-  "tag": "ss-$listen_ip-$port"
+  "tag": "$inbound_tag"
 }
 EOF
 )
 
     jq ".inbounds += [$inbound]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
-    add_routing "ss-$listen_ip-$port" "$outbound_tag"
+    add_routing "$inbound_tag" "$outbound_tag"
 
     log_info "Shadowsocks已添加: $listen_ip:$port"
 }
@@ -290,6 +288,7 @@ add_socks5() {
 
     backup_config "$XRAY_CONFIG"
 
+    local inbound_tag="socks-$listen_ip-$port"
     local inbound=$(cat <<EOF
 {
   "port": $port,
@@ -305,13 +304,13 @@ add_socks5() {
     ],
     "udp": true
   },
-  "tag": "socks-$listen_ip-$port"
+  "tag": "$inbound_tag"
 }
 EOF
 )
 
     jq ".inbounds += [$inbound]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
-    add_routing "socks-$listen_ip-$port" "$outbound_tag"
+    add_routing "$inbound_tag" "$outbound_tag"
 
     log_info "SOCKS5已添加: $listen_ip:$port"
 }
@@ -327,22 +326,18 @@ add_outbound_and_routing() {
     # 检查出站是否已存在
     if ! jq -e ".outbounds[] | select(.tag == \"$outbound_tag\")" "$XRAY_CONFIG" >/dev/null 2>&1; then
         
-        # 基础服务器对象
         local server_obj=$(jq -n --arg addr "$proxy_ip" --argjson port "$proxy_port" \
             '{address: $addr, port: $port}')
 
-        # 如果有用户名和密码，添加认证信息
         if [ -n "$username" ] && [ -n "$password" ]; then
             local user_auth_obj=$(jq -n --arg user "$username" --arg pass "$password" \
                 '{user: $user, pass: $pass}')
             server_obj=$(echo "$server_obj" | jq ".users = [$user_auth_obj]")
         fi
 
-        # 构建完整的出站对象
         local outbound_obj=$(jq -n --arg tag "$outbound_tag" --argjson server "$server_obj" \
             '{tag: $tag, protocol: "socks", settings: {servers: [$server]}}')
 
-        # 添加到Xray配置
         jq ".outbounds += [$outbound_obj]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
         
         if [ -n "$username" ]; then
@@ -454,17 +449,14 @@ batch_add_proxies() {
         return
     fi
     
-    # 获取统一配置
     read -p "请输入统一监听端口 (留空则为每个代理随机生成): " unified_port
     local unified_user=""
     local unified_pass=""
-    if [ "$proxy_type" = "2" ]; then # SOCKS5
+    if [ "$proxy_type" = "2" ]; then
         read -p "请输入统一用户名 (留空则为每个代理随机生成): " unified_user
     fi
-    # SS 和 SOCKS5 都有密码
     read -p "请输入统一密码 (留空则为每个代理随机生成): " unified_pass
 
-    # 解析3proxy配置
     local proxy_ips=()
     local proxy_ports=()
     local proxy_user=""
@@ -479,7 +471,6 @@ batch_add_proxies() {
         return
     fi
 
-    # 根据是否使用统一端口，决定生成数量和监听模式
     local count
     local listen_method
     if [ -n "$unified_port" ]; then
@@ -518,14 +509,12 @@ batch_add_proxies() {
     echo "" >> "$output_file"
 
     for i in $(seq 1 $count); do
-        # 确定IP索引
         local idx=$(((i-1) % num_available_ips))
         
         local proxy_ip="${proxy_ips[$idx]}"
         local proxy_port="${proxy_ports[$idx]}"
         local outbound_tag="3proxy-$proxy_ip-$proxy_port"
 
-        # 确定监听IP
         local listen_ip
         case "$listen_method" in
             1) listen_ip="$proxy_ip" ;;
@@ -533,15 +522,12 @@ batch_add_proxies() {
             *) listen_ip="0.0.0.0" ;;
         esac
 
-        # 添加出站
         add_outbound_and_routing "$outbound_tag" "$proxy_ip" "$proxy_port" "$proxy_user" "$proxy_pass"
 
-        # 确定端口
         local port
         if [ -n "$unified_port" ]; then port="$unified_port"; else port=$(get_next_port); fi
 
         if [ "$proxy_type" = "1" ]; then
-            # Shadowsocks
             local password
             if [ -n "$unified_pass" ]; then password="$unified_pass"; else password=$(generate_password); fi
             local method="aes-256-gcm"
@@ -553,7 +539,6 @@ batch_add_proxies() {
             echo "$link  # 出站IP: $proxy_ip"
 
         elif [ "$proxy_type" = "2" ]; then
-            # SOCKS5
             local username
             local password
             if [ -n "$unified_user" ]; then username="$unified_user"; else username="user_$i"; fi
@@ -565,7 +550,6 @@ batch_add_proxies() {
             echo "$link  # 出站IP: $proxy_ip" >> "$output_file"
             echo "$link  # 出站IP: $proxy_ip"
         fi
-
         sleep 0.1
     done
 
@@ -583,25 +567,119 @@ list_proxies() {
     fi
 
     echo -e "${YELLOW}Shadowsocks代理:${NC}"
-    jq -r '.inbounds[] | select(.protocol == "shadowsocks") | "监听: \(.listen):\(.port) | 密码: \(.settings.password) | 方法: \(.settings.method)"' "$XRAY_CONFIG" 2>/dev/null
+    jq -r '.inbounds[] | select(.protocol == "shadowsocks") | "监听: \(.listen):\(.port) | 密码: \(.settings.password) | 方法: \(.settings.method) | 标签: \(.tag)"' "$XRAY_CONFIG" 2>/dev/null
 
     echo
     echo -e "${YELLOW}SOCKS5代理:${NC}"
-    jq -r '.inbounds[] | select(.protocol == "socks") | "监听: \(.listen):\(.port) | 用户: \(.settings.accounts[0].user) | 密码: \(.settings.accounts[0].pass)"' "$XRAY_CONFIG" 2>/dev/null
+    jq -r '.inbounds[] | select(.protocol == "socks") | "监听: \(.listen):\(.port) | 用户: \(.settings.accounts[0].user) | 密码: \(.settings.accounts[0].pass) | 标签: \(.tag)"' "$XRAY_CONFIG" 2>/dev/null
 
     echo
     echo -e "${YELLOW}出站配置:${NC}"
     jq -r '.outbounds[] | select(.protocol == "socks") | "标签: \(.tag) | 目标: \(.settings.servers[0].address):\(.settings.servers[0].port) | 认证用户: \(.settings.servers[0].users[0].user // "无")"' "$XRAY_CONFIG" 2>/dev/null
 }
 
+# ---> 新增功能: 删除单个代理 <---
+delete_single_proxy() {
+    echo -e "${BLUE}=== 删除单个代理 ===${NC}"
+    if [ ! -f "$XRAY_CONFIG" ]; then log_error "Xray配置文件不存在。"; return; fi
+
+    log_info "正在加载入站代理列表..."
+    local tags=($(jq -r '.inbounds[].tag' "$XRAY_CONFIG"))
+    local details=()
+    
+    if [ ${#tags[@]} -eq 0 ]; then
+        log_warn "没有找到任何可以删除的入站代理。"
+        return
+    fi
+    
+    for tag in "${tags[@]}"; do
+        details+=("$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | "\(.protocol) | \(.listen):\(.port) | 标签(tag): \(.tag)"' "$XRAY_CONFIG")")
+    done
+
+    echo -e "${YELLOW}请选择要删除的代理:${NC}"
+    for i in "${!details[@]}"; do
+        echo "[$((i+1))] ${details[$i]}"
+    done
+    echo "[0] 返回主菜单"
+    
+    read -p "请输入选项: " choice
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#details[@]} ]; then
+        log_error "无效的选择。"
+        return
+    fi
+
+    if [ "$choice" -eq 0 ]; then
+        log_info "操作取消。"
+        return
+    fi
+    
+    local tag_to_delete="${tags[$((choice-1))]}"
+    read -p "您确定要删除代理 '${details[$((choice-1))]}' 吗? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+        log_info "操作已取消。"
+        return
+    fi
+
+    log_info "正在删除入站: ${tag_to_delete} ..."
+    backup_config "$XRAY_CONFIG"
+    
+    local new_config=$(jq --arg t "$tag_to_delete" \
+        'del(.inbounds[] | select(.tag == $t)) | del(.routing.rules[] | select(.inboundTag[0] == $t))' \
+        "$XRAY_CONFIG")
+        
+    echo "$new_config" > "$XRAY_CONFIG"
+    log_info "代理 '${tag_to_delete}' 及其关联路由规则已删除。"
+    restart_xray
+}
+
+# ---> 新增功能: 按用户名批量删除 <---
+batch_delete_proxies_by_user() {
+    echo -e "${BLUE}=== 按用户名批量删除代理 ===${NC}"
+    log_warn "此功能仅适用于SOCKS5代理。"
+    if [ ! -f "$XRAY_CONFIG" ]; then log_error "Xray配置文件不存在。"; return; fi
+    
+    read -p "请输入要匹配的用户名 (例如, 输入 'user_' 会匹配所有 'user_...' 开头的用户): " pattern
+    if [ -z "$pattern" ]; then
+        log_error "用户名模式不能为空。"
+        return
+    fi
+    
+    local tags_to_delete_json=$(jq -c --arg p "$pattern" \
+        '[.inbounds[] | select(.protocol == "socks" and (.settings.accounts[].user | contains($p))) | .tag]' \
+        "$XRAY_CONFIG")
+    
+    local num_to_delete=$(echo "$tags_to_delete_json" | jq 'length')
+    if [ "$num_to_delete" -eq 0 ]; then
+        log_warn "没有找到用户匹配 '${pattern}' 的SOCKS5代理。"
+        return
+    fi
+    
+    echo -e "${YELLOW}以下 ${num_to_delete} 个代理将被删除 (基于标签):${NC}"
+    echo "$tags_to_delete_json" | jq -r '.[]'
+    echo
+    read -p "您确定要全部删除吗? 此操作不可恢复！ (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+        log_info "操作已取消。"
+        return
+    fi
+    
+    log_info "正在批量删除 ${num_to_delete} 个代理..."
+    backup_config "$XRAY_CONFIG"
+
+    local new_config=$(jq --argjson tags "$tags_to_delete_json" \
+        'del(.inbounds[] | select(.tag as $t | $tags | index($t))) | del(.routing.rules[] | select(.inboundTag[0] as $it | $tags | index($it)))' \
+        "$XRAY_CONFIG")
+        
+    echo "$new_config" > "$XRAY_CONFIG"
+    log_info "批量删除完成。"
+    restart_xray
+}
+
+
 # 导出所有代理链接
 export_all_links() {
     echo -e "${BLUE}=== 导出所有代理链接 ===${NC}"
-
-    if [ ! -f "$XRAY_CONFIG" ]; then
-        log_error "Xray配置文件不存在。"
-        return
-    fi
+    if [ ! -f "$XRAY_CONFIG" ]; then log_error "Xray配置文件不存在。"; return; fi
 
     local output_file="/tmp/all_proxy_links_$(date +%Y%m%d_%H%M%S).txt"
     echo "# 全部代理链接导出 - $(date)" > "$output_file"
@@ -609,15 +687,12 @@ export_all_links() {
 
     echo -e "${YELLOW}Shadowsocks链接:${NC}"
     echo "# Shadowsocks链接" >> "$output_file"
-
-    # 导出SS链接
     jq -c '.inbounds[] | select(.protocol == "shadowsocks")' "$XRAY_CONFIG" 2>/dev/null | while read -r line; do
         if [ -n "$line" ]; then
             local listen=$(echo "$line" | jq -r '.listen')
             local port=$(echo "$line" | jq -r '.port')
             local method=$(echo "$line" | jq -r '.settings.method')
             local password=$(echo "$line" | jq -r '.settings.password')
-
             local ss_link="ss://$(echo -n "$method:$password" | base64)@$listen:$port"
             echo "$ss_link"
             echo "$ss_link" >> "$output_file"
@@ -628,15 +703,12 @@ export_all_links() {
     echo -e "${YELLOW}SOCKS5链接:${NC}"
     echo "" >> "$output_file"
     echo "# SOCKS5链接" >> "$output_file"
-
-    # 导出SOCKS5链接
     jq -c '.inbounds[] | select(.protocol == "socks")' "$XRAY_CONFIG" 2>/dev/null | while read -r line; do
         if [ -n "$line" ]; then
             local listen=$(echo "$line" | jq -r '.listen')
             local port=$(echo "$line" | jq -r '.port')
             local username=$(echo "$line" | jq -r '.settings.accounts[0].user')
             local password=$(echo "$line" | jq -r '.settings.accounts[0].pass')
-
             local socks_link="socks5://$username:$password@$listen:$port"
             echo "$socks_link"
             echo "$socks_link" >> "$output_file"
@@ -668,13 +740,16 @@ install_xray() {
 main_menu() {
     while true; do
         echo
-        echo -e "${BLUE}=== Xray代理管理脚本 (SS/SOCKS5) v5.3 ===${NC}"
+        echo -e "${BLUE}=== Xray代理管理脚本 (SS/SOCKS5) v5.4 ===${NC}"
         echo "[1] 添加单个代理"
         echo "[2] 批量添加代理"
         echo "[3] 列出现有代理和出站"
         echo "[4] 导出所有代理链接"
-        echo "[5] 查看3proxy配置"
-        echo "[6] 查看备份"
+        echo -e "${RED}[5] 删除单个代理${NC}"
+        echo -e "${RED}[6] 按用户名批量删除代理${NC}"
+        echo "----------------------------"
+        echo "[7] 查看3proxy配置"
+        echo "[8] 查看备份"
         echo "[0] 退出"
         echo
 
@@ -685,8 +760,10 @@ main_menu() {
             2) batch_add_proxies ;;
             3) list_proxies ;;
             4) export_all_links ;;
-            5) show_3proxy_config ;;
-            6) ls -la "$BACKUP_DIR" ;;
+            5) delete_single_proxy ;;
+            6) batch_delete_proxies_by_user ;;
+            7) show_3proxy_config ;;
+            8) ls -la "$BACKUP_DIR" ;;
             0) log_info "正在退出"; exit 0 ;;
             *) log_error "无效的选择" ;;
         esac
@@ -699,19 +776,16 @@ main_menu() {
 # 检查依赖
 check_deps() {
     local missing=()
-
     for cmd in jq openssl; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
     done
-
     if [ ${#missing[@]} -gt 0 ]; then
         log_error "缺少依赖项: ${missing[*]}"
         log_info "请尝试使用以下命令安装: apt update && apt install -y ${missing[*]}"
         exit 1
     fi
-
     if ! command -v xray >/dev/null 2>&1; then
         install_xray
     fi
@@ -723,15 +797,12 @@ main() {
         log_error "请使用root权限运行此脚本。"
         exit 1
     fi
-
     check_deps
     create_base_xray_config
-
     if [ ! -f "$PROXY_CONFIG" ]; then
         log_error "3proxy配置文件不存在: $PROXY_CONFIG"
         exit 1
     fi
-
     main_menu
 }
 
