@@ -648,17 +648,62 @@ batch_delete_proxies_by_port() {
 
 # 导出所有代理链接
 export_all_links() {
-    # 省略... (此函数无改动)
+    echo -e "${BLUE}=== 导出所有代理链接 ===${NC}"
+    if [ ! -f "$XRAY_CONFIG" ]; then log_error "Xray配置文件不存在。"; return; fi
+
+    local output_file="/tmp/all_proxy_links_$(date +%Y%m%d_%H%M%S).txt"
+    echo "# 全部代理链接导出 - $(date)" > "$output_file"
+    echo "" >> "$output_file"
+
+    echo -e "${YELLOW}Shadowsocks链接:${NC}"
+    echo "# Shadowsocks链接" >> "$output_file"
+    jq -c '.inbounds[] | select(.protocol == "shadowsocks")' "$XRAY_CONFIG" 2>/dev/null | while read -r line; do
+        if [ -n "$line" ]; then
+            local listen=$(echo "$line" | jq -r '.listen')
+            local port=$(echo "$line" | jq -r '.port')
+            local method=$(echo "$line" | jq -r '.settings.method')
+            local password=$(echo "$line" | jq -r '.settings.password')
+            local ss_link="ss://$(echo -n "$method:$password" | base64)@$listen:$port"
+            echo "$ss_link"
+            echo "$ss_link" >> "$output_file"
+        fi
+    done
+
+    echo
+    echo -e "${YELLOW}SOCKS5链接:${NC}"
+    echo "" >> "$output_file"
+    echo "# SOCKS5链接" >> "$output_file"
+    jq -c '.inbounds[] | select(.protocol == "socks")' "$XRAY_CONFIG" 2>/dev/null | while read -r line; do
+        if [ -n "$line" ]; then
+            local listen=$(echo "$line" | jq -r '.listen')
+            local port=$(echo "$line" | jq -r '.port')
+            local username=$(echo "$line" | jq -r '.settings.accounts[0].user')
+            local password=$(echo "$line" | jq -r '.settings.accounts[0].pass')
+            local socks_link="socks5://$username:$password@$listen:$port"
+            echo "$socks_link"
+            echo "$socks_link" >> "$output_file"
+        fi
+    done
+
+    echo
+    log_info "所有链接已导出到: $output_file"
 }
 
 # 显示3proxy配置
 show_3proxy_config() {
-    # 省略... (此函数无改动)
+    echo -e "${BLUE}=== 3proxy配置内容 ===${NC}"
+    if [ -f "$PROXY_CONFIG" ]; then
+        cat "$PROXY_CONFIG"
+    else
+        log_error "3proxy配置文件不存在。"
+    fi
 }
 
 # 安装Xray
 install_xray() {
-    # 省略... (此函数无改动)
+    log_info "未找到Xray，开始安装..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)"
+    log_info "Xray安装完成。"
 }
 
 # 主菜单
