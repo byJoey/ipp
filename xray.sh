@@ -274,7 +274,9 @@ add_shadowsocks() {
     local password="$3"
     local method="$4"
     local outbound_tag="$5"
-    local inbound_tag="ss-$listen_ip-$port"
+    # [修复] 通过附加唯一的出站信息来确保入站标签的唯一性
+    local unique_outbound_suffix=$(echo "$outbound_tag" | sed 's/3proxy-//')
+    local inbound_tag="ss-$listen_ip-$port-via-$unique_outbound_suffix"
     local inbound
     inbound=$(jq -n \
         --argjson port "$port" \
@@ -294,7 +296,9 @@ add_socks5() {
     local username="$3"
     local password="$4"
     local outbound_tag="$5"
-    local inbound_tag="socks-$listen_ip-$port"
+    # [修复] 通过附加唯一的出站信息来确保入站标签的唯一性
+    local unique_outbound_suffix=$(echo "$outbound_tag" | sed 's/3proxy-//')
+    local inbound_tag="socks-$listen_ip-$port-via-$unique_outbound_suffix"
     local account
     account=$(jq -n --arg user "$username" --arg pass "$password" '{user: $user, pass: $pass}')
     local inbound
@@ -806,4 +810,4 @@ main() {
     main_menu
 }
 
-main "$@"
+main "$@"这个脚本删除全部ip的功能
