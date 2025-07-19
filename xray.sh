@@ -197,6 +197,21 @@ generate_user_id() {
     echo "user_$(openssl rand -hex 4)"
 }
 
+# 生成唯一标签（修复标签冲突问题）
+generate_unique_tag() {
+    local base_tag="$1"
+    local counter=1
+    local unique_tag="$base_tag"
+    
+    # 检查标签是否已存在
+    while jq -e ".inbounds[] | select(.tag == \"$unique_tag\")" "$XRAY_CONFIG" >/dev/null 2>&1; do
+        unique_tag="${base_tag}-${counter}"
+        counter=$((counter + 1))
+    done
+    
+    echo "$unique_tag"
+}
+
 # 备份和创建配置
 backup_config() {
     if [ -f "$1" ]; then
@@ -205,6 +220,7 @@ backup_config() {
         log_info "配置文件已备份: $bn"
     fi
 }
+
 create_base_xray_config() {
     if [ ! -f "$XRAY_CONFIG" ]; then
         log_info "正在创建基础Xray配置文件..."
@@ -267,16 +283,19 @@ get_next_port() {
     done
 }
 
-# 添加Shadowsocks/SOCKS5入站
+# 添加Shadowsocks/SOCKS5入站（修复标签冲突）
 add_shadowsocks() {
     local listen_ip="$1"
     local port="$2"
     local password="$3"
     local method="$4"
     local outbound_tag="$5"
-    # [修复] 通过附加唯一的出站信息来确保入站标签的唯一性
+    
+    # 生成基础标签并确保唯一性
     local unique_outbound_suffix=$(echo "$outbound_tag" | sed 's/3proxy-//')
-    local inbound_tag="ss-$listen_ip-$port-via-$unique_outbound_suffix"
+    local base_tag="ss-$listen_ip-$port-via-$unique_outbound_suffix"
+    local inbound_tag=$(generate_unique_tag "$base_tag")
+    
     local inbound
     inbound=$(jq -n \
         --argjson port "$port" \
@@ -288,17 +307,21 @@ add_shadowsocks() {
     
     jq ".inbounds += [$inbound]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
     add_routing "$inbound_tag" "$outbound_tag"
-    log_info "Shadowsocks已添加: $listen_ip:$port"
+    log_info "Shadowsocks已添加: $listen_ip:$port (标签: $inbound_tag)"
 }
+
 add_socks5() {
     local listen_ip="$1"
     local port="$2"
     local username="$3"
     local password="$4"
     local outbound_tag="$5"
-    # [修复] 通过附加唯一的出站信息来确保入站标签的唯一性
+    
+    # 生成基础标签并确保唯一性
     local unique_outbound_suffix=$(echo "$outbound_tag" | sed 's/3proxy-//')
-    local inbound_tag="socks-$listen_ip-$port-via-$unique_outbound_suffix"
+    local base_tag="socks-$listen_ip-$port-via-$unique_outbound_suffix"
+    local inbound_tag=$(generate_unique_tag "$base_tag")
+    
     local account
     account=$(jq -n --arg user "$username" --arg pass "$password" '{user: $user, pass: $pass}')
     local inbound
@@ -311,7 +334,7 @@ add_socks5() {
 
     jq ".inbounds += [$inbound]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
     add_routing "$inbound_tag" "$outbound_tag"
-    log_info "SOCKS5已添加: $listen_ip:$port"
+    log_info "SOCKS5已添加: $listen_ip:$port (标签: $inbound_tag)"
 }
 
 # 添加出站和路由规则
@@ -339,6 +362,7 @@ add_outbound_and_routing() {
         fi
     fi
 }
+
 add_routing() {
     local inbound_tag="$1"
     local outbound_tag="$2"
@@ -346,6 +370,67 @@ add_routing() {
     rule=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{type: "field", inboundTag: [$it], outboundTag: $ot}')
     jq ".routing.rules += [$rule]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
     log_info "已添加路由规则: $inbound_tag -> $outbound_tag"
+}
+
+# 检查并修复现有配置中的重复标签
+fix_duplicate_tags() {
+    echo -e "${BLUE}=== 检查并修复重复标签 ===${NC}"
+    
+    if [ ! -f "$XRAY_CONFIG" ]; then
+        log_warn "Xray配置文件不存在，跳过标签检查。"
+        return
+    fi
+    
+    local duplicate_count=0
+    local tags_to_fix=()
+    
+    # 获取所有入站标签
+    local all_tags=($(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null | sort))
+    
+    # 检查重复标签
+    local prev_tag=""
+    for tag in "${all_tags[@]}"; do
+        if [ "$tag" = "$prev_tag" ]; then
+            tags_to_fix+=("$tag")
+            duplicate_count=$((duplicate_count + 1))
+        fi
+        prev_tag="$tag"
+    done
+    
+    if [ $duplicate_count -eq 0 ]; then
+        log_info "未发现重复标签。"
+        return
+    fi
+    
+    log_warn "发现 $duplicate_count 个重复标签，开始修复..."
+    backup_config "$XRAY_CONFIG"
+    
+    # 修复重复标签
+    for dup_tag in "${tags_to_fix[@]}"; do
+        log_info "修复重复标签: $dup_tag"
+        
+        # 获取所有重复的入站配置
+        local dup_inbounds=$(jq -c ".inbounds[] | select(.tag == \"$dup_tag\")" "$XRAY_CONFIG")
+        local counter=2
+        
+        # 重命名除第一个之外的所有重复标签
+        while IFS= read -r inbound_config; do
+            if [ -n "$inbound_config" ] && [ "$counter" -gt 1 ]; then
+                local new_tag="${dup_tag}-${counter}"
+                
+                # 更新入站标签
+                jq "(.inbounds[] | select(.tag == \"$dup_tag\" and . == $inbound_config)).tag = \"$new_tag\"" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+                
+                # 更新对应的路由规则
+                jq "(.routing.rules[] | select(.inboundTag[]? == \"$dup_tag\")).inboundTag = [\"$new_tag\"]" "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+                
+                log_info "已将重复标签重命名为: $new_tag"
+                counter=$((counter + 1))
+            fi
+        done <<< "$dup_inbounds"
+    done
+    
+    log_info "标签修复完成！"
 }
 
 # 添加单个代理
@@ -569,7 +654,6 @@ batch_add_exclusive_proxies() {
     log_info "批量独享代理创建完成！"; restart_xray
 }
 
-
 # 列出现有代理
 list_proxies() {
     echo -e "${BLUE}=== 现有代理列表 ===${NC}"
@@ -591,12 +675,13 @@ list_proxies() {
 release_exclusive_ip() {
     local ip=$1
     if [ -z "$ip" ]; then return; fi
-    if grep -q "^${ip}$" "$EXCLUSIVE_IP_LIST_FILE"; then
+    if [ -f "$EXCLUSIVE_IP_LIST_FILE" ] && grep -q "^${ip}$" "$EXCLUSIVE_IP_LIST_FILE"; then
         log_info "正在释放独享IP: ${ip}"
         grep -v "^${ip}$" "$EXCLUSIVE_IP_LIST_FILE" > "${EXCLUSIVE_IP_LIST_FILE}.tmp"
         mv "${EXCLUSIVE_IP_LIST_FILE}.tmp" "$EXCLUSIVE_IP_LIST_FILE"
     fi
 }
+
 find_and_release_ip_for_inbound_tag() {
     local inbound_tag=$1
     local outbound_tag
@@ -638,6 +723,7 @@ delete_single_proxy() {
     log_info "代理 '${tag_to_delete}' 及其关联路由规则已删除。"
     restart_xray
 }
+
 batch_delete_proxies_by_user() {
     echo -e "${BLUE}=== 按用户名批量删除代理 ===${NC}"
     log_warn "此功能仅适用于SOCKS5代理。"
@@ -663,6 +749,7 @@ batch_delete_proxies_by_user() {
     log_info "批量删除完成。"
     restart_xray
 }
+
 batch_delete_proxies_by_port() {
     echo -e "${BLUE}=== 按端口批量删除代理 ===${NC}"
     if [ ! -f "$XRAY_CONFIG" ]; then log_error "Xray配置文件不存在。"; return; fi
@@ -688,6 +775,109 @@ batch_delete_proxies_by_port() {
     echo "$new_config" > "$XRAY_CONFIG"
     log_info "批量删除完成。"
     restart_xray
+}
+
+# 清除所有代理（删除全部IP的功能）
+delete_all_proxies() {
+    echo -e "${RED}=== 删除全部代理 (危险操作) ===${NC}"
+    log_warn "此操作将删除所有代理配置，包括入站、出站和路由规则！"
+    
+    if [ ! -f "$XRAY_CONFIG" ]; then
+        log_error "Xray配置文件不存在。"
+        return
+    fi
+    
+    # 显示当前代理数量
+    local inbound_count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
+    local outbound_count=$(jq '.outbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
+    local custom_outbound_count=$(jq '[.outbounds[] | select(.protocol == "socks")] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
+    
+    echo -e "${YELLOW}当前配置统计:${NC}"
+    echo "  - 入站代理: $inbound_count 个"
+    echo "  - 自定义出站: $custom_outbound_count 个"
+    echo "  - 总出站: $outbound_count 个"
+    echo
+    
+    if [ "$inbound_count" -eq 0 ] && [ "$custom_outbound_count" -eq 0 ]; then
+        log_warn "当前没有任何代理配置需要删除。"
+        return
+    fi
+    
+    echo -e "${RED}警告: 此操作不可恢复！${NC}"
+    echo "以下操作将被执行："
+    echo "1. 删除所有入站代理配置"
+    echo "2. 删除所有自定义出站配置（保留 direct 和 blocked）"
+    echo "3. 清除所有相关路由规则"
+    echo "4. 清空独享IP列表"
+    echo "5. 自动备份当前配置"
+    echo
+    
+    read -p "请输入 'DELETE ALL' 确认删除所有代理: " confirm
+    if [ "$confirm" != "DELETE ALL" ]; then
+        log_info "操作已取消。"
+        return
+    fi
+    
+    # 二次确认
+    read -p "您真的确定要删除所有代理吗？这个操作无法撤销！(y/N): " final_confirm
+    if [ "$final_confirm" != "y" ] && [ "$final_confirm" != "Y" ]; then
+        log_info "操作已取消。"
+        return
+    fi
+    
+    log_info "开始执行删除操作..."
+    
+    # 备份当前配置
+    backup_config "$XRAY_CONFIG"
+    
+    # 清空独享IP列表
+    if [ -f "$EXCLUSIVE_IP_LIST_FILE" ]; then
+        > "$EXCLUSIVE_IP_LIST_FILE"
+        log_info "已清空独享IP列表。"
+    fi
+    
+    # 重置配置为基础状态
+    cat > "$XRAY_CONFIG" << 'EOF'
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "inbounds": [],
+    "outbounds": [
+        {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {}
+        },
+        {
+            "tag": "blocked",
+            "protocol": "blackhole",
+            "settings": {}
+        }
+    ],
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+            {
+                "type": "field",
+                "ip": [
+                    "geoip:private"
+                ],
+                "outboundTag": "blocked"
+            }
+        ]
+    }
+}
+EOF
+    
+    log_info "所有代理配置已删除！"
+    log_info "配置已重置为基础状态。"
+    
+    # 重启服务
+    restart_xray
+    
+    echo -e "${GREEN}删除操作完成！${NC}"
+    echo "如需恢复，请使用备份文件: $BACKUP_DIR"
 }
 
 # 导出和显示配置
@@ -721,6 +911,7 @@ export_all_links() {
     echo
     log_info "所有链接已导出到: $out"
 }
+
 show_3proxy_config() {
     echo -e "${BLUE}=== 3proxy配置内容 ===${NC}"
     if [ -f "$PROXY_CONFIG" ]; then
@@ -736,6 +927,7 @@ install_xray() {
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)"
     log_info "Xray安装完成。"
 }
+
 check_deps() {
     local m=()
     for c in jq openssl; do
@@ -757,19 +949,21 @@ check_deps() {
 main_menu() {
     while true; do
         echo
-        echo -e "${BLUE}=== Xray代理管理脚本 v6.2 (稳定版) ===${NC}"
+        echo -e "${BLUE}=== Xray代理管理脚本 v6.3 (修复标签冲突版) ===${NC}"
         echo "[1] 添加单个代理 (支持设置IP独享)"
         echo "[2] 批量添加共享代理 (轮询出口)"
         echo "[3] 批量添加独享代理 (一对一出口/强制创建)"
         echo "[4] 列出现有代理和出站"
         echo "[5] 导出所有代理链接"
+        echo "[6] 检查并修复重复标签"
         echo -e "${RED}--- 删除操作 (自动释放独享IP) ---${NC}"
-        echo -e "${RED}[6] 删除单个代理${NC}"
-        echo -e "${RED}[7] 按用户名批量删除SOCKS5代理${NC}"
-        echo -e "${RED}[8] 按端口批量删除代理${NC}"
+        echo -e "${RED}[7] 删除单个代理${NC}"
+        echo -e "${RED}[8] 按用户名批量删除SOCKS5代理${NC}"
+        echo -e "${RED}[9] 按端口批量删除代理${NC}"
+        echo -e "${RED}[10] 删除全部代理 (危险操作)${NC}"
         echo "-------------------------------------"
-        echo "[9] 查看3proxy配置"
-        echo "[10] 查看备份"
+        echo "[11] 查看3proxy配置"
+        echo "[12] 查看备份"
         echo "[0] 退出"
         echo
 
@@ -781,11 +975,13 @@ main_menu() {
             3) batch_add_exclusive_proxies ;;
             4) list_proxies ;;
             5) export_all_links ;;
-            6) delete_single_proxy ;;
-            7) batch_delete_proxies_by_user ;;
-            8) batch_delete_proxies_by_port ;;
-            9) show_3proxy_config ;;
-            10) ls -la "$BACKUP_DIR" ;;
+            6) fix_duplicate_tags ;;
+            7) delete_single_proxy ;;
+            8) batch_delete_proxies_by_user ;;
+            9) batch_delete_proxies_by_port ;;
+            10) delete_all_proxies ;;
+            11) show_3proxy_config ;;
+            12) ls -la "$BACKUP_DIR" ;;
             0) log_info "正在退出"; exit 0 ;;
             *) log_error "无效的选择" ;;
         esac
@@ -810,4 +1006,4 @@ main() {
     main_menu
 }
 
-main "$@"这个脚本删除全部ip的功能
+main "$@"
