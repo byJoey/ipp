@@ -330,7 +330,8 @@ fix_duplicate_tags() {
     done
     
     # 检查空标签
-    local empty_tags=$(jq '[.inbounds[] | select(.tag == "" or .tag == null)] | length' "$XRAY_CONFIG")
+    local empty_tags=$(jq '[.inbounds[] | select(.tag == "" or .tag == null)] | length' "$XRAY_CONFIG" 2>/dev/null)
+    empty_tags=${empty_tags:-0}  # 确保不为空
     
     if [ ${#duplicate_tags[@]} -eq 0 ] && [ "$empty_tags" -eq 0 ]; then
         log_info "未发现重复标签或空标签。"
@@ -485,7 +486,9 @@ validate_config() {
     fi
     
     # 检查空标签
-    local empty_count=$(jq '[.inbounds[] | select(.tag == "" or .tag == null)] | length' "$XRAY_CONFIG")
+    local empty_count=$(jq '[.inbounds[] | select(.tag == "" or .tag == null)] | length' "$XRAY_CONFIG" 2>/dev/null)
+    empty_count=${empty_count:-0}  # 确保不为空
+    
     if [ "$empty_count" -gt 0 ]; then
         log_warn "仍然存在 $empty_count 个空标签，但这不会阻止Xray运行。"
     fi
@@ -499,13 +502,14 @@ test_config() {
     log_info "测试Xray配置..."
     
     if command -v xray >/dev/null 2>&1; then
-        if xray test -config "$XRAY_CONFIG" 2>/dev/null; then
+        # 使用正确的xray命令语法
+        if xray run -test -config "$XRAY_CONFIG" 2>/dev/null; then
             log_info "Xray配置测试通过！"
             return 0
         else
             log_error "Xray配置测试失败！"
             echo "详细错误信息："
-            xray test -config "$XRAY_CONFIG" || true
+            xray run -test -config "$XRAY_CONFIG" 2>&1 || true
             return 1
         fi
     else
@@ -958,9 +962,14 @@ delete_all_proxies() {
     fi
     
     # 显示当前代理数量
-    local inbound_count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
-    local outbound_count=$(jq '.outbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
-    local custom_outbound_count=$(jq '[.outbounds[] | select(.protocol == "socks")] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
+    local inbound_count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null)
+    local outbound_count=$(jq '.outbounds | length' "$XRAY_CONFIG" 2>/dev/null)
+    local custom_outbound_count=$(jq '[.outbounds[] | select(.protocol == "socks")] | length' "$XRAY_CONFIG" 2>/dev/null)
+    
+    # 确保变量不为空
+    inbound_count=${inbound_count:-0}
+    outbound_count=${outbound_count:-0}
+    custom_outbound_count=${custom_outbound_count:-0}
     
     echo -e "${YELLOW}当前配置统计:${NC}"
     echo "  - 入站代理: $inbound_count 个"
@@ -1094,13 +1103,22 @@ show_3proxy_config() {
 # 显示统计信息
 show_stats() {
     if [ ! -f "$XRAY_CONFIG" ]; then
+        echo -e "${BLUE}=== 配置统计 ===${NC}"
+        echo "配置文件不存在"
         return
     fi
     
-    local inbound_count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
-    local ss_count=$(jq '[.inbounds[] | select(.protocol == "shadowsocks")] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
-    local socks_count=$(jq '[.inbounds[] | select(.protocol == "socks")] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
-    local outbound_count=$(jq '[.outbounds[] | select(.protocol == "socks")] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
+    # 安全地获取统计信息，处理空值
+    local inbound_count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null)
+    local ss_count=$(jq '[.inbounds[] | select(.protocol == "shadowsocks")] | length' "$XRAY_CONFIG" 2>/dev/null)
+    local socks_count=$(jq '[.inbounds[] | select(.protocol == "socks")] | length' "$XRAY_CONFIG" 2>/dev/null)
+    local outbound_count=$(jq '[.outbounds[] | select(.protocol == "socks")] | length' "$XRAY_CONFIG" 2>/dev/null)
+    
+    # 确保变量不为空
+    inbound_count=${inbound_count:-0}
+    ss_count=${ss_count:-0}
+    socks_count=${socks_count:-0}
+    outbound_count=${outbound_count:-0}
     
     echo -e "${BLUE}=== 配置统计 ===${NC}"
     echo "入站代理总数: $inbound_count"
@@ -1112,6 +1130,7 @@ show_stats() {
     local exclusive_count=0
     if [ -f "$EXCLUSIVE_IP_LIST_FILE" ]; then
         exclusive_count=$(wc -l < "$EXCLUSIVE_IP_LIST_FILE" 2>/dev/null || echo "0")
+        exclusive_count=${exclusive_count:-0}
     fi
     echo "独享IP数量: $exclusive_count"
 }
@@ -1282,7 +1301,13 @@ main() {
             fi
         else
             # 检查重复标签
-            local duplicate_count=$(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null | sort | uniq -d | wc -l)
+            local all_tags=($(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null))
+            local duplicate_count=0
+            if [ ${#all_tags[@]} -gt 0 ]; then
+                duplicate_count=$(printf '%s\n' "${all_tags[@]}" | sort | uniq -d | wc -l)
+                duplicate_count=${duplicate_count:-0}
+            fi
+            
             if [ "$duplicate_count" -gt 0 ]; then
                 log_warn "检测到重复标签，建议运行自动修复功能。"
                 echo "您可以选择菜单项 [6] 进行自动修复。"
