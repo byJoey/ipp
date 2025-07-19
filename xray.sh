@@ -72,7 +72,7 @@ generate_user_id() {
 restart_xray() {
     log_info "正在重启Xray服务..."
     if systemctl is-active --quiet xray; then
-        systemctl restart xray
+        sudo systemctl restart xray
         log_info "Xray服务已成功重启。"
     else
         log_warn "Xray服务未在运行。请手动启动它。"
