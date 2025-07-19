@@ -133,7 +133,7 @@ show_local_ip_menu() {
 
     echo -e "${BLUE}=== 可用的本地监听IP ===${NC}"
     for i in "${!local_ips[@]}"; do
-        echo "[$((i+1))] ${local_ips[$i]}"
+        echo "[$((i + 1))] ${local_ips[$i]}"
     done
     echo "[0] 使用 0.0.0.0 (监听所有网络接口)"
     echo
@@ -143,7 +143,7 @@ show_local_ip_menu() {
         selected_listen_ip="0.0.0.0"
         return 0
     elif [ "$choice" -ge 1 ] && [ "$choice" -le ${#local_ips[@]} ] 2>/dev/null; then
-        selected_listen_ip="${local_ips[$((choice-1))]}"
+        selected_listen_ip="${local_ips[$((choice - 1))]}"
         return 0
     else
         log_error "无效的选择。"
@@ -162,7 +162,7 @@ show_proxy_ip_menu() {
 
     echo -e "${BLUE}=== 可用的 (非独享) 3proxy出站代理 ===${NC}"
     for i in "${!proxy_ips_ref[@]}"; do
-        echo "[$((i+1))] ${proxy_ips_ref[$i]}:${proxy_ports_ref[$i]}"
+        echo "[$((i + 1))] ${proxy_ips_ref[$i]}:${proxy_ports_ref[$i]}"
     done
     echo "[0] 返回主菜单"
     echo
@@ -171,8 +171,8 @@ show_proxy_ip_menu() {
     if [ "$choice" = "0" ]; then
         return 1
     elif [ "$choice" -ge 1 ] && [ "$choice" -le ${#proxy_ips_ref[@]} ] 2>/dev/null; then
-        selected_proxy_ip="${proxy_ips_ref[$((choice-1))]}"
-        selected_proxy_port="${proxy_ports_ref[$((choice-1))]}"
+        selected_proxy_ip="${proxy_ips_ref[$((choice - 1))]}"
+        selected_proxy_port="${proxy_ports_ref[$((choice - 1))]}"
         return 0
     else
         log_error "无效的选择。"
@@ -210,7 +210,36 @@ create_base_xray_config() {
         log_info "正在创建基础Xray配置文件..."
         mkdir -p "$(dirname "$XRAY_CONFIG")"
         cat > "$XRAY_CONFIG" << 'EOF'
-{ "log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [ { "tag": "direct", "protocol": "freedom", "settings": {} }, { "tag": "blocked", "protocol": "blackhole", "settings": {} } ], "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "ip": ["geoip:private"], "outboundTag": "blocked" } ] } }
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "inbounds": [],
+    "outbounds": [
+        {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {}
+        },
+        {
+            "tag": "blocked",
+            "protocol": "blackhole",
+            "settings": {}
+        }
+    ],
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+            {
+                "type": "field",
+                "ip": [
+                    "geoip:private"
+                ],
+                "outboundTag": "blocked"
+            }
+        ]
+    }
+}
 EOF
         log_info "基础配置文件已创建。"
     fi
@@ -324,11 +353,9 @@ add_single_proxy() {
     get_available_proxies all_ips all_ports available_ips available_ports
     if ! show_proxy_ip_menu available_ips available_ports; then return; fi
     if ! show_local_ip_menu; then return; fi
-
     local outbound_tag="3proxy-$selected_proxy_ip-$selected_proxy_port"
     add_outbound_and_routing "$outbound_tag" "$selected_proxy_ip" "$selected_proxy_port" "$proxy_user" "$proxy_pass"
     backup_config "$XRAY_CONFIG"
-
     echo -e "${BLUE}选择代理类型:${NC}"
     echo "[1] Shadowsocks"
     echo "[2] SOCKS5"
@@ -340,7 +367,6 @@ add_single_proxy() {
         0) return ;;
         *) log_error "无效的选择"; return ;;
     esac
-
     read -p "是否将此出站IP ${selected_proxy_ip} 设为独享? (y/n): " make_exclusive
     if [[ "$make_exclusive" == "y" ]]; then
         echo "$selected_proxy_ip" >> "$EXCLUSIVE_IP_LIST_FILE"
@@ -445,72 +471,69 @@ batch_add_shared_proxies() {
 
 # 批量添加独享代理
 batch_add_exclusive_proxies() {
-    echo -e "${BLUE}=== 批量添加独享代理 (一对一出口) ===${NC}"
-    log_info "此模式会为每个可用的(非独享)出口IP创建一个对应的入口代理。"
-    log_info "入口的监听IP与出口IP将保持一致，创建后该出口IP将被自动标记为独享。"
+    echo -e "${BLUE}=== 批量添加独享代理 (一对一出口/强制创建) ===${NC}"
     local all_ips=() all_ports=() available_ips=() available_ports=()
-    local proxy_user=""
-    local proxy_pass=""
-    if ! parse_3proxy_config "$PROXY_CONFIG" all_ips all_ports proxy_user proxy_pass; then
-        return
-    fi
+    local proxy_user="" proxy_pass=""
+    if ! parse_3proxy_config "$PROXY_CONFIG" all_ips all_ports proxy_user proxy_pass; then return; fi
     get_available_proxies all_ips all_ports available_ips available_ports
-    local num_available_ips=${#available_ips[@]}
-    if [ "$num_available_ips" -eq 0 ]; then
-        log_warn "没有可用的(非独享)IP地址来创建代理。"
-        return
+    
+    local ips_to_process=() ports_to_process=()
+    
+    if [ ${#available_ips[@]} -eq 0 ]; then
+        log_warn "所有IP地址均已被标记为独享。"
+        read -p "是否要从总IP列表中强行指定一个范围来创建代理? (y/n): " force_create
+        if [[ "$force_create" != "y" ]]; then return; fi
+
+        local total_ips=${#all_ips[@]}
+        log_info "总共有 ${total_ips} 个IP地址 (在 3proxy.cfg 中)。"
+        read -p "请输入IP位置范围 (例如: 1-10 或 50-80): " range_input
+        
+        if [[ ! "$range_input" =~ ^[0-9]+-[0-9]+$ ]]; then log_error "范围格式错误。"; return; fi
+        local start=$(echo "$range_input" | cut -d- -f1)
+        local end=$(echo "$range_input" | cut -d- -f2)
+        if [ "$start" -gt "$end" ] || [ "$start" -lt 1 ] || [ "$end" -gt "$total_ips" ]; then log_error "范围无效。请输入 1 到 ${total_ips} 之间的有效范围。"; return; fi
+        
+        for (( i=start-1; i<end; i++ )); do
+            ips_to_process+=("${all_ips[i]}")
+            ports_to_process+=("${all_ports[i]}")
+        done
+    else
+        ips_to_process=("${available_ips[@]}")
+        ports_to_process=("${available_ports[@]}")
     fi
+
+    local num_to_process=${#ips_to_process[@]}
+    if [ "$num_to_process" -eq 0 ]; then log_warn "没有选中任何IP用于创建代理。"; return; fi
+    
+    log_info "此模式将为选中的 ${num_to_process} 个IP创建一对一的独享代理。"
+    log_info "入口的监听IP将与出口IP保持一致，创建后IP将被自动标记为独享。"
+
     read -p "代理类型 (1-SS, 2-SOCKS5): " proxy_type
-    if [ "$proxy_type" != "1" ] && [ "$proxy_type" != "2" ]; then
-        log_error "无效的代理类型。"
-        return
-    fi
+    if [ "$proxy_type" != "1" ] && [ "$proxy_type" != "2" ]; then log_error "无效的代理类型。"; return; fi
     read -p "请输入所有代理统一使用的监听端口: " unified_port
-    if ! [[ "$unified_port" =~ ^[0-9]+$ ]]; then
-        log_error "无效的端口号，请输入数字。"
-        return
-    fi
-    local unified_user=""
-    local unified_pass=""
-    if [ "$proxy_type" = "2" ]; then
-        read -p "请输入统一用户名 (留空则随机): " unified_user
-    fi
+    if ! [[ "$unified_port" =~ ^[0-9]+$ ]]; then log_error "无效的端口号，请输入数字。"; return; fi
+    local unified_user="" unified_pass=""
+    if [ "$proxy_type" = "2" ]; then read -p "请输入统一用户名 (留空则随机): " unified_user; fi
     read -p "请输入统一密码 (留空则随机): " unified_pass
-    echo -e "${YELLOW}即将为以下 ${num_available_ips} 个IP地址创建独享代理:${NC}"
-    printf " %s\n" "${available_ips[@]}"
-    echo "所有代理将监听在端口: ${unified_port}"
+    echo -e "${YELLOW}即将为以下 ${num_to_process} 个IP地址创建独享代理:${NC}"; printf " %s\n" "${ips_to_process[@]}"; echo "所有代理将监听在端口: ${unified_port}"
     read -p "您确定要继续吗? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-        log_info "操作已取消。"
-        return
-    fi
-    log_info "开始为 ${num_available_ips} 个IP创建独享代理..."
+    if [ "$confirm" != "y" ]; then log_info "操作已取消。"; return; fi
+    
+    log_info "开始为 ${num_to_process} 个IP创建独享代理..."
     backup_config "$XRAY_CONFIG"
-    for i in "${!available_ips[@]}"; do
-        local proxy_ip="${available_ips[$i]}"
-        local proxy_port="${available_ports[$i]}"
-        local listen_ip="$proxy_ip"
-        local port="$unified_port"
+    for i in "${!ips_to_process[@]}"; do
+        local proxy_ip="${ips_to_process[i]}"; local proxy_port="${ports_to_process[i]}"; local listen_ip="$proxy_ip"; local port="$unified_port"
         local outbound_tag="3proxy-$proxy_ip-$proxy_port"
         add_outbound_and_routing "$outbound_tag" "$proxy_ip" "$proxy_port" "$proxy_user" "$proxy_pass"
-        if [ "$proxy_type" = "1" ]; then
-            local password
-            if [ -n "$unified_pass" ]; then password="$unified_pass"; else password=$(generate_password); fi
-            add_shadowsocks "$listen_ip" "$port" "$password" "aes-256-gcm" "$outbound_tag"
-        elif [ "$proxy_type" = "2" ]; then
-            local username
-            local password
-            if [ -n "$unified_user" ]; then username="$unified_user"; else username="user_d_$((i + 1))"; fi
-            if [ -n "$unified_pass" ]; then password="$unified_pass"; else password=$(generate_password); fi
-            add_socks5 "$listen_ip" "$port" "$username" "$password" "$outbound_tag"
-        fi
-        echo "$proxy_ip" >> "$EXCLUSIVE_IP_LIST_FILE"
+        if [ "$proxy_type" = "1" ]; then local password; if [ -n "$unified_pass" ]; then password="$unified_pass"; else password=$(generate_password); fi; add_shadowsocks "$listen_ip" "$port" "$password" "aes-256-gcm" "$outbound_tag";
+        elif [ "$proxy_type" = "2" ]; then local username password; if [ -n "$unified_user" ]; then username="$unified_user"; else username="user_d_$((i+1))"; fi; if [ -n "$unified_pass" ]; then password="$unified_pass"; else password=$(generate_password); fi; add_socks5 "$listen_ip" "$port" "$username" "$password" "$outbound_tag"; fi
+        grep -qxF "$proxy_ip" "$EXCLUSIVE_IP_LIST_FILE" || echo "$proxy_ip" >> "$EXCLUSIVE_IP_LIST_FILE"
         log_info "IP ${proxy_ip} 已创建代理并标记为独享。"
         sleep 0.1
     done
-    log_info "批量独享代理创建完成！"
-    restart_xray
+    log_info "批量独享代理创建完成！"; restart_xray
 }
+
 
 # 列出现有代理
 list_proxies() {
@@ -532,9 +555,7 @@ list_proxies() {
 # 释放独享IP
 release_exclusive_ip() {
     local ip=$1
-    if [ -z "$ip" ]; then
-        return
-    fi
+    if [ -z "$ip" ]; then return; fi
     if grep -q "^${ip}$" "$EXCLUSIVE_IP_LIST_FILE"; then
         log_info "正在释放独享IP: ${ip}"
         grep -v "^${ip}$" "$EXCLUSIVE_IP_LIST_FILE" > "${EXCLUSIVE_IP_LIST_FILE}.tmp"
@@ -602,15 +623,9 @@ delete_single_proxy() {
 batch_delete_proxies_by_user() {
     echo -e "${BLUE}=== 按用户名批量删除代理 ===${NC}"
     log_warn "此功能仅适用于SOCKS5代理。"
-    if [ ! -f "$XRAY_CONFIG" ]; then
-        log_error "Xray配置文件不存在。"
-        return
-    fi
+    if [ ! -f "$XRAY_CONFIG" ]; then log_error "Xray配置文件不存在。"; return; fi
     read -p "请输入要匹配的用户名: " pattern
-    if [ -z "$pattern" ]; then
-        log_error "用户名模式不能为空。"
-        return
-    fi
+    if [ -z "$pattern" ]; then log_error "用户名模式不能为空。"; return; fi
     local tags_json
     tags_json=$(jq -c --arg p "$pattern" '[.inbounds[] | select(.protocol == "socks" and (.settings.accounts[].user | contains($p))) | .tag]' "$XRAY_CONFIG")
     local num
@@ -623,10 +638,7 @@ batch_delete_proxies_by_user() {
     echo "$tags_json" | jq -r '.[]'
     echo
     read -p "您确定要全部删除吗? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-        log_info "操作已取消。"
-        return
-    fi
+    if [ "$confirm" != "y" ]; then log_info "操作已取消。"; return; fi
     backup_config "$XRAY_CONFIG"
     for tag in $(echo "$tags_json" | jq -r '.[]'); do
         find_and_release_ip_for_inbound_tag "$tag"
@@ -640,31 +652,19 @@ batch_delete_proxies_by_user() {
 }
 batch_delete_proxies_by_port() {
     echo -e "${BLUE}=== 按端口批量删除代理 ===${NC}"
-    if [ ! -f "$XRAY_CONFIG" ]; then
-        log_error "Xray配置文件不存在。"
-        return
-    fi
+    if [ ! -f "$XRAY_CONFIG" ]; then log_error "Xray配置文件不存在。"; return; fi
     read -p "请输入要删除的代理所使用的端口号: " port
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        log_error "无效的端口号。"
-        return
-    fi
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then log_error "无效的端口号。"; return; fi
     local tags_json
     tags_json=$(jq -c --argjson p "$port" '[.inbounds[] | select(.port == $p) | .tag]' "$XRAY_CONFIG")
     local num
     num=$(echo "$tags_json" | jq 'length')
-    if [ "$num" -eq 0 ]; then
-        log_warn "没有找到在端口 ${port} 上运行的代理。"
-        return
-    fi
+    if [ "$num" -eq 0 ]; then log_warn "没有找到在端口 ${port} 上运行的代理。"; return; fi
     echo -e "${YELLOW}以下 ${num} 个在端口 ${port} 上的代理将被删除:${NC}"
     jq -r --argjson p "$port" '.inbounds[] | select(.port == $p) | " - 协议: \(.protocol), 监听IP: \(.listen), 标签: \(.tag)"' "$XRAY_CONFIG"
     echo
     read -p "您确定要全部删除吗? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-        log_info "操作已取消。"
-        return
-    fi
+    if [ "$confirm" != "y" ]; then log_info "操作已取消。"; return; fi
     backup_config "$XRAY_CONFIG"
     for tag in $(echo "$tags_json" | jq -r '.[]'); do
         find_and_release_ip_for_inbound_tag "$tag"
@@ -750,10 +750,10 @@ check_deps() {
 main_menu() {
     while true; do
         echo
-        echo -e "${BLUE}=== Xray代理管理脚本 (SS/SOCKS5) v5.8 (独享IP增强版) ===${NC}"
+        echo -e "${BLUE}=== Xray代理管理脚本 v6.0 (稳定版) ===${NC}"
         echo "[1] 添加单个代理 (支持设置IP独享)"
         echo "[2] 批量添加共享代理 (轮询出口)"
-        echo "[3] 批量添加独享代理 (一对一出口)"
+        echo "[3] 批量添加独享代理 (一对一出口/强制创建)"
         echo "[4] 列出现有代理和出站"
         echo "[5] 导出所有代理链接"
         echo -e "${RED}--- 删除操作 (自动释放独享IP) ---${NC}"
