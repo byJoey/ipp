@@ -102,6 +102,63 @@ restart_x3ui() {
     restart_services
 }
 
+# 修复数据库锁定问题
+fix_database_lock() {
+    echo -e "${BLUE}=== 修复数据库锁定问题 ===${NC}"
+    log_warn "此操作将尝试解决数据库锁定问题。"
+    
+    if [ ! -f "$X3UI_DB" ]; then 
+        log_error "3x-ui数据库不存在。"
+        return
+    fi
+
+    read -p "您确定要尝试修复数据库锁定问题吗? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then 
+        log_info "操作已取消。"
+        return
+    fi
+
+    backup_database
+
+    log_info "正在停止可能占用数据库的服务..."
+    sudo systemctl stop "$X3UI_SERVICE" 2>/dev/null || true
+    sudo systemctl stop "xray" 2>/dev/null || true
+    sleep 3
+
+    log_info "正在检查数据库占用进程..."
+    local db_processes=$(lsof "$X3UI_DB" 2>/dev/null || true)
+    if [ -n "$db_processes" ]; then
+        echo "发现以下进程占用数据库:"
+        echo "$db_processes"
+        
+        # 获取进程ID并终止
+        echo "$db_processes" | awk 'NR>1 {print $2}' | while read pid; do
+            if [ -n "$pid" ]; then
+                log_info "终止进程 $pid"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 2
+    fi
+
+    log_info "正在检查数据库完整性..."
+    if sqlite3 "$X3UI_DB" "PRAGMA integrity_check;" >/dev/null 2>&1; then
+        log_info "数据库完整性检查通过。"
+    else
+        log_warn "数据库可能有损坏，尝试修复..."
+        sqlite3 "$X3UI_DB" "PRAGMA journal_mode=DELETE; VACUUM;" 2>/dev/null || true
+    fi
+
+    log_info "正在重启服务..."
+    restart_services
+
+    if check_database_lock; then
+        log_info "数据库锁定问题已解决。"
+    else
+        log_error "无法解决数据库锁定问题，可能需要重启系统。"
+    fi
+}
+
 # 清理错误的数据库记录
 clean_broken_records() {
     echo -e "${BLUE}=== 清理错误的数据库记录 ===${NC}"
@@ -238,7 +295,7 @@ check_dependencies() {
 # 检查tag是否在数据库中已存在
 check_tag_in_db() {
     local tag="$1"
-    local count=$(sqlite3 "$X3UI_DB" "SELECT COUNT(*) FROM inbounds WHERE tag = '$tag';")
+    local count=$(safe_sqlite_exec "SELECT COUNT(*) FROM inbounds WHERE tag = '$tag';" || echo "0")
     [ "$count" -gt 0 ]
 }
 
@@ -259,18 +316,442 @@ generate_unique_tag() {
     done
 }
 
+# 临时数据库操作模式
+readonly TEMP_DB="/tmp/x-ui-temp-$(date +%s).db"
+
+# 复制数据库到临时位置
+copy_db_to_temp() {
+    if [ ! -f "$X3UI_DB" ]; then
+        log_error "原数据库不存在: $X3UI_DB"
+        return 1
+    fi
+    
+    log_info "正在复制数据库到临时位置..."
+    if cp "$X3UI_DB" "$TEMP_DB"; then
+        log_info "数据库已复制到: $TEMP_DB"
+        return 0
+    else
+        log_error "复制数据库失败"
+        return 1
+    fi
+}
+
+# 将临时数据库替换回原位置
+replace_db_from_temp() {
+    if [ ! -f "$TEMP_DB" ]; then
+        log_error "临时数据库不存在: $TEMP_DB"
+        return 1
+    fi
+    
+    # 备份原数据库
+    backup_database
+    
+    log_info "正在停止3x-ui服务..."
+    sudo systemctl stop "$X3UI_SERVICE" 2>/dev/null || true
+    sleep 2
+    
+    log_info "正在替换数据库..."
+    if cp "$TEMP_DB" "$X3UI_DB"; then
+        log_info "数据库已成功替换"
+        # 清理临时文件
+        rm -f "$TEMP_DB"
+        
+        # 重启服务
+        restart_services
+        return 0
+    else
+        log_error "替换数据库失败"
+        return 1
+    fi
+}
+
+# 清理临时数据库
+cleanup_temp_db() {
+    if [ -f "$TEMP_DB" ]; then
+        rm -f "$TEMP_DB"
+        log_info "临时数据库已清理"
+    fi
+}
+
+# 使用临时数据库的安全执行函数
+safe_temp_sqlite_exec() {
+    local sql="$1"
+    if [ ! -f "$TEMP_DB" ]; then
+        log_error "临时数据库不存在"
+        return 1
+    fi
+    
+    sqlite3 "$TEMP_DB" "$sql" 2>/dev/null
+}
+
+# 检查IP和端口组合是否已存在（临时数据库版本）
+check_ip_port_exists_temp() {
+    local listen_ip="$1"
+    local port="$2"
+    local count=$(safe_temp_sqlite_exec "SELECT COUNT(*) FROM inbounds WHERE listen = '$listen_ip' AND port = $port;" || echo "0")
+    [ "$count" -gt 0 ]
+}
+
+# 检查tag是否在临时数据库中已存在
+check_tag_in_temp_db() {
+    local tag="$1"
+    local count=$(safe_temp_sqlite_exec "SELECT COUNT(*) FROM inbounds WHERE tag = '$tag';" || echo "0")
+    [ "$count" -gt 0 ]
+}
+
+# 生成唯一的tag（临时数据库版本）
+generate_unique_tag_temp() {
+    local protocol="$1"
+    local listen_ip="$2"
+    local port="$3"
+    
+    while true; do
+        local timestamp=$(date +%s%N | cut -b1-13)
+        local tag="inbound-$protocol-$listen_ip-$port-$timestamp"
+        if ! check_tag_in_temp_db "$tag"; then
+            echo "$tag"
+            return
+        fi
+        sleep 0.001
+    done
+}
+
+# 添加Shadowsocks到临时数据库
+add_shadowsocks_to_temp_db() {
+    local listen_ip="$1"
+    local port="$2"
+    local password="$3"
+    local method="$4"
+    local remark="$5"
+    
+    # 转义特殊字符
+    local escaped_password=$(escape_json "$password")
+    local escaped_remark=$(escape_json "$remark")
+    
+    # 生成客户端email和subId
+    local email=$(openssl rand -hex 4)
+    local subId=$(openssl rand -hex 8)
+    
+    # 构建设置JSON
+    local settings="{
+  \"method\": \"$method\",
+  \"password\": \"$escaped_password\",
+  \"network\": \"tcp,udp\",
+  \"clients\": [
+    {
+      \"method\": \"\",
+      \"password\": \"$escaped_password\",
+      \"email\": \"$email\",
+      \"limitIp\": 0,
+      \"totalGB\": 0,
+      \"expiryTime\": 0,
+      \"enable\": true,
+      \"tgId\": \"\",
+      \"subId\": \"$subId\",
+      \"comment\": \"\",
+      \"reset\": 0
+    }
+  ],
+  \"ivCheck\": false
+}"
+    
+    local stream_settings="{
+  \"network\": \"tcp\",
+  \"security\": \"none\",
+  \"externalProxy\": [],
+  \"tcpSettings\": {
+    \"acceptProxyProtocol\": false,
+    \"header\": {
+      \"type\": \"none\"
+    }
+  }
+}"
+    
+    local sniffing="{
+  \"enabled\": false,
+  \"destOverride\": [
+    \"http\",
+    \"tls\",
+    \"quic\",
+    \"fakedns\"
+  ],
+  \"metadataOnly\": false,
+  \"routeOnly\": false
+}"
+    
+    local allocate="{
+  \"strategy\": \"always\",
+  \"refresh\": 5,
+  \"concurrency\": 3
+}"
+    
+    local unique_tag=$(generate_unique_tag_temp "ss" "$listen_ip" "$port")
+    
+    # 检查IP和端口组合是否已存在
+    if check_ip_port_exists_temp "$listen_ip" "$port"; then
+        log_error "代理已存在: $listen_ip:$port，跳过创建。"
+        return 1
+    fi
+    
+    # 插入到临时数据库
+    if safe_temp_sqlite_exec "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'shadowsocks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"; then
+        log_info "Shadowsocks已添加到临时数据库: $listen_ip:$port (方法: $method)"
+        return 0
+    else
+        log_error "添加Shadowsocks到临时数据库失败: $listen_ip:$port"
+        return 1
+    fi
+}
+
+# 添加SOCKS5到临时数据库
+add_socks5_to_temp_db() {
+    local listen_ip="$1"
+    local port="$2"
+    local username="$3"
+    local password="$4"
+    local remark="$5"
+    local enable_udp="${6:-true}"
+    
+    # 转义特殊字符
+    local escaped_username=$(escape_json "$username")
+    local escaped_password=$(escape_json "$password")
+    local escaped_remark=$(escape_json "$remark")
+    
+    local settings="{
+  \"auth\": \"password\",
+  \"accounts\": [
+    {
+      \"user\": \"$escaped_username\",
+      \"pass\": \"$escaped_password\"
+    }
+  ],
+  \"udp\": $enable_udp,
+  \"ip\": \"127.0.0.1\"
+}"
+    
+    local stream_settings=""
+    
+    local sniffing="{
+  \"enabled\": false,
+  \"destOverride\": [
+    \"http\",
+    \"tls\",
+    \"quic\",
+    \"fakedns\"
+  ],
+  \"metadataOnly\": false,
+  \"routeOnly\": false
+}"
+    
+    local allocate="{
+  \"strategy\": \"always\",
+  \"refresh\": 5,
+  \"concurrency\": 3
+}"
+    
+    local unique_tag=$(generate_unique_tag_temp "socks" "$listen_ip" "$port")
+    
+    # 检查IP和端口组合是否已存在
+    if check_ip_port_exists_temp "$listen_ip" "$port"; then
+        log_error "代理已存在: $listen_ip:$port，跳过创建。"
+        return 1
+    fi
+    
+    # 插入到临时数据库
+    if safe_temp_sqlite_exec "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'socks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"; then
+        log_info "SOCKS5已添加到临时数据库: $listen_ip:$port (用户: $username, UDP: $enable_udp)"
+        return 0
+    else
+        log_error "添加SOCKS5到临时数据库失败: $listen_ip:$port"
+        return 1
+    fi
+}
+
+# 临时数据库模式的批量添加
+batch_add_with_temp_db() {
+    echo -e "${BLUE}=== 批量添加代理 (临时数据库模式) ===${NC}"
+    log_info "此模式将使用临时数据库避免锁定问题。"
+    
+    # 复制数据库到临时位置
+    if ! copy_db_to_temp; then
+        return 1
+    fi
+    
+    # 设置错误处理
+    trap cleanup_temp_db EXIT
+    
+    read -p "代理类型 (1-SS, 2-SOCKS5): " proxy_type
+    if [ "$proxy_type" != "1" ] && [ "$proxy_type" != "2" ]; then
+        log_error "无效的代理类型。"
+        cleanup_temp_db
+        return
+    fi
+
+    read -p "请输入生成数量: " count
+    if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+        log_error "无效的数量。"
+        cleanup_temp_db
+        return
+    fi
+
+    if ! show_local_ip_menu; then 
+        cleanup_temp_db
+        return
+    fi
+
+    read -p "请输入统一监听端口 (留空则每个代理使用不同随机端口): " unified_port
+    local unified_user=""
+    local unified_pass=""
+    local enable_udp=true
+    
+    if [ "$proxy_type" = "2" ]; then
+        read -p "请输入统一用户名 (留空则每个代理使用不同用户名): " unified_user
+        echo "是否为所有SOCKS5代理启用UDP支持:"
+        echo "[1] 启用UDP (推荐)"
+        echo "[2] 禁用UDP"
+        read -p "请选择: " udp_choice
+        if [ "$udp_choice" = "2" ]; then
+            enable_udp=false
+        fi
+    fi
+    read -p "请输入统一密码 (留空则每个代理使用不同密码): " unified_pass
+
+    log_info "开始在临时数据库中批量生成 $count 个代理..."
+    local success_count=0
+
+    for i in $(seq 1 $count); do
+        local port
+        if [ -n "$unified_port" ]; then
+            port="$unified_port"
+        else
+            # 在临时数据库中获取可用端口
+            port=$(generate_port)
+            while check_ip_port_exists_temp "$selected_listen_ip" "$port"; do
+                port=$(generate_port)
+            done
+        fi
+
+        if [ "$proxy_type" = "1" ]; then
+            # Shadowsocks
+            local password="${unified_pass:-$(generate_password)}"
+            local remark="SS-Batch-$i-$selected_listen_ip-$port"
+            if add_shadowsocks_to_temp_db "$selected_listen_ip" "$port" "$password" "aes-256-gcm" "$remark"; then
+                ((success_count++))
+            fi
+        elif [ "$proxy_type" = "2" ]; then
+            # SOCKS5
+            local username="${unified_user:-user_$i}"
+            local password="${unified_pass:-$(generate_password)}"
+            local remark="SOCKS5-Batch-$i-$selected_listen_ip-$port"
+            if add_socks5_to_temp_db "$selected_listen_ip" "$port" "$username" "$password" "$remark" "$enable_udp"; then
+                ((success_count++))
+            fi
+        fi
+
+        sleep 0.01
+    done
+
+    log_info "临时数据库中成功创建 $success_count 个代理。"
+    
+    if [ $success_count -gt 0 ]; then
+        read -p "是否将更改应用到正式数据库? (y/n): " apply_changes
+        if [ "$apply_changes" = "y" ]; then
+            if replace_db_from_temp; then
+                log_info "批量添加完成！成功创建 $success_count 个代理。"
+            else
+                log_error "应用更改失败！"
+            fi
+        else
+            log_info "更改已取消，临时数据库将被删除。"
+            cleanup_temp_db
+        fi
+    else
+        log_warn "没有成功创建任何代理。"
+        cleanup_temp_db
+    fi
+}
+
+# 检查并处理数据库锁定问题
+check_database_lock() {
+    local max_retries=5
+    local retry_count=0
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if sqlite3 "$X3UI_DB" "SELECT 1;" >/dev/null 2>&1; then
+            return 0
+        fi
+        
+        log_warn "数据库被锁定，正在尝试解决... (尝试 $((retry_count + 1))/$max_retries)"
+        
+        # 停止可能正在使用数据库的服务
+        if [ $retry_count -eq 0 ]; then
+            log_info "正在停止3x-ui服务以释放数据库锁..."
+            sudo systemctl stop "$X3UI_SERVICE" 2>/dev/null || true
+            sleep 2
+        fi
+        
+        # 检查是否有其他进程在使用数据库
+        local db_processes=$(lsof "$X3UI_DB" 2>/dev/null | grep -v "COMMAND" || true)
+        if [ -n "$db_processes" ]; then
+            log_warn "发现以下进程正在使用数据库:"
+            echo "$db_processes"
+            
+            # 尝试终止占用数据库的进程
+            echo "$db_processes" | awk '{print $2}' | while read pid; do
+                if [ -n "$pid" ] && [ "$pid" != "PID" ]; then
+                    log_info "尝试终止进程 $pid"
+                    kill -TERM "$pid" 2>/dev/null || true
+                fi
+            done
+            sleep 2
+        fi
+        
+        ((retry_count++))
+        sleep 1
+    done
+    
+    log_error "无法解决数据库锁定问题，请手动处理。"
+    return 1
+}
+
+# 安全的数据库操作函数
+safe_sqlite_exec() {
+    local sql="$1"
+    local max_retries=3
+    local retry_count=0
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if sqlite3 "$X3UI_DB" "$sql" 2>/dev/null; then
+            return 0
+        fi
+        
+        local error_msg=$(sqlite3 "$X3UI_DB" "$sql" 2>&1 || true)
+        if echo "$error_msg" | grep -q "database is locked"; then
+            log_warn "数据库锁定，等待重试... ($((retry_count + 1))/$max_retries)"
+            sleep 2
+            ((retry_count++))
+        else
+            log_error "数据库操作失败: $error_msg"
+            return 1
+        fi
+    done
+    
+    log_error "数据库操作失败，已达到最大重试次数。"
+    return 1
+}
+
 # 检查IP和端口组合是否已存在
 check_ip_port_exists() {
     local listen_ip="$1"
     local port="$2"
-    local count=$(sqlite3 "$X3UI_DB" "SELECT COUNT(*) FROM inbounds WHERE listen = '$listen_ip' AND port = $port;")
+    local count=$(safe_sqlite_exec "SELECT COUNT(*) FROM inbounds WHERE listen = '$listen_ip' AND port = $port;" || echo "0")
     [ "$count" -gt 0 ]
 }
 
 # 检查端口是否在数据库中已存在
 check_port_in_db() {
     local port="$1"
-    local count=$(sqlite3 "$X3UI_DB" "SELECT COUNT(*) FROM inbounds WHERE port = $port;")
+    local count=$(safe_sqlite_exec "SELECT COUNT(*) FROM inbounds WHERE port = $port;" || echo "0")
     [ "$count" -gt 0 ]
 }
 
@@ -297,7 +778,7 @@ escape_json() {
     echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-# 添加Shadowsocks入站到数据库
+# 添加Shadowsocks入站到数据库（智能模式：自动处理锁定）
 add_shadowsocks_to_db() {
     local listen_ip="$1"
     local port="$2"
@@ -378,13 +859,43 @@ add_shadowsocks_to_db() {
         return 1
     fi
     
-    # 插入到数据库 (包含所有必需字段)
-    sqlite3 "$X3UI_DB" "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'shadowsocks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"
+    # 尝试直接插入，如果锁定则使用临时数据库模式
+    local sql="INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'shadowsocks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"
     
-    log_info "Shadowsocks已添加: $listen_ip:$port (方法: $method)"
+    if safe_sqlite_exec "$sql"; then
+        log_info "Shadowsocks已添加: $listen_ip:$port (方法: $method)"
+        return 0
+    else
+        log_warn "数据库可能被锁定，尝试使用临时数据库模式..."
+        
+        # 使用临时数据库模式
+        if ! copy_db_to_temp; then
+            log_error "无法创建临时数据库"
+            return 1
+        fi
+        
+        # 在临时数据库中执行
+        if safe_temp_sqlite_exec "$sql"; then
+            log_info "Shadowsocks已添加到临时数据库: $listen_ip:$port"
+            
+            # 替换回原数据库
+            if replace_db_from_temp; then
+                log_info "Shadowsocks已成功添加: $listen_ip:$port (方法: $method)"
+                return 0
+            else
+                log_error "应用更改失败"
+                cleanup_temp_db
+                return 1
+            fi
+        else
+            log_error "添加Shadowsocks失败: $listen_ip:$port"
+            cleanup_temp_db
+            return 1
+        fi
+    fi
 }
 
-# 添加SOCKS5入站到数据库
+# 添加SOCKS5入站到数据库（智能模式：自动处理锁定）
 add_socks5_to_db() {
     local listen_ip="$1"
     local port="$2"
@@ -443,10 +954,40 @@ add_socks5_to_db() {
         return 1
     fi
     
-    # 插入到数据库 (包含所有必需字段)
-    sqlite3 "$X3UI_DB" "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'socks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"
+    # 尝试直接插入，如果锁定则使用临时数据库模式
+    local sql="INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'socks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"
     
-    log_info "SOCKS5已添加: $listen_ip:$port (用户: $username, UDP: $enable_udp)"
+    if safe_sqlite_exec "$sql"; then
+        log_info "SOCKS5已添加: $listen_ip:$port (用户: $username, UDP: $enable_udp)"
+        return 0
+    else
+        log_warn "数据库可能被锁定，尝试使用临时数据库模式..."
+        
+        # 使用临时数据库模式
+        if ! copy_db_to_temp; then
+            log_error "无法创建临时数据库"
+            return 1
+        fi
+        
+        # 在临时数据库中执行
+        if safe_temp_sqlite_exec "$sql"; then
+            log_info "SOCKS5已添加到临时数据库: $listen_ip:$port"
+            
+            # 替换回原数据库
+            if replace_db_from_temp; then
+                log_info "SOCKS5已成功添加: $listen_ip:$port (用户: $username, UDP: $enable_udp)"
+                return 0
+            else
+                log_error "应用更改失败"
+                cleanup_temp_db
+                return 1
+            fi
+        else
+            log_error "添加SOCKS5失败: $listen_ip:$port"
+            cleanup_temp_db
+            return 1
+        fi
+    fi
 }
 
 #================================================
@@ -1399,6 +1940,7 @@ main_menu() {
         echo "[15] 重启3x-ui和xray服务"
         echo "[16] 修复数据库格式问题"
         echo "[17] 清理错误的数据库记录"
+        echo "[18] 修复数据库锁定问题"
         echo "[0] 退出"
         echo
 
@@ -1422,6 +1964,7 @@ main_menu() {
             15) restart_services ;;
             16) fix_database_format ;;
             17) clean_broken_records ;;
+            18) fix_database_lock ;;
             0) log_info "正在退出"; exit 0 ;;
             *) log_error "无效的选择" ;;
         esac
@@ -1441,6 +1984,12 @@ main() {
 
     # 检查依赖
     check_dependencies
+
+    # 检查数据库锁定状态
+    if ! check_database_lock; then
+        log_error "数据库被锁定，请选择菜单中的 [18] 修复数据库锁定问题"
+        echo "或者手动执行: systemctl stop x-ui && systemctl start x-ui"
+    fi
 
     log_info "3x-ui代理管理脚本已启动"
     log_info "数据库位置: $X3UI_DB"
