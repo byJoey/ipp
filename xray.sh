@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #================================================
-# 3x-ui代理管理脚本  (基于3x-ui数据库)
+# 3x-ui代理管理脚本 v6.2 (基于3x-ui数据库)
 # 功能：管理3x-ui代理服务器配置
 # 支持：Shadowsocks和SOCKS5协议
 # 基于3x-ui数据库操作，完全兼容3x-ui格式
@@ -259,6 +259,14 @@ generate_unique_tag() {
     done
 }
 
+# 检查IP和端口组合是否已存在
+check_ip_port_exists() {
+    local listen_ip="$1"
+    local port="$2"
+    local count=$(sqlite3 "$X3UI_DB" "SELECT COUNT(*) FROM inbounds WHERE listen = '$listen_ip' AND port = $port;")
+    [ "$count" -gt 0 ]
+}
+
 # 检查端口是否在数据库中已存在
 check_port_in_db() {
     local port="$1"
@@ -364,6 +372,12 @@ add_shadowsocks_to_db() {
     # 生成唯一的tag
     local unique_tag=$(generate_unique_tag "ss" "$listen_ip" "$port")
     
+    # 检查IP和端口组合是否已存在
+    if check_ip_port_exists "$listen_ip" "$port"; then
+        log_error "代理已存在: $listen_ip:$port，跳过创建。"
+        return 1
+    fi
+    
     # 插入到数据库 (包含所有必需字段)
     sqlite3 "$X3UI_DB" "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'shadowsocks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"
     
@@ -377,13 +391,14 @@ add_socks5_to_db() {
     local username="$3"
     local password="$4"
     local remark="$5"
+    local enable_udp="${6:-true}"  # 默认启用UDP
     
     # 转义特殊字符
     local escaped_username=$(escape_json "$username")
     local escaped_password=$(escape_json "$password")
     local escaped_remark=$(escape_json "$remark")
     
-    # 构建与3x-ui完全兼容的settings JSON（基于实际数据格式）
+    # 构建与3x-ui完全兼容的settings JSON（UDP可配置）
     local settings="{
   \"auth\": \"password\",
   \"accounts\": [
@@ -392,7 +407,7 @@ add_socks5_to_db() {
       \"pass\": \"$escaped_password\"
     }
   ],
-  \"udp\": false,
+  \"udp\": $enable_udp,
   \"ip\": \"127.0.0.1\"
 }"
     
@@ -422,10 +437,16 @@ add_socks5_to_db() {
     # 生成唯一的tag
     local unique_tag=$(generate_unique_tag "socks" "$listen_ip" "$port")
     
+    # 检查IP和端口组合是否已存在
+    if check_ip_port_exists "$listen_ip" "$port"; then
+        log_error "代理已存在: $listen_ip:$port，跳过创建。"
+        return 1
+    fi
+    
     # 插入到数据库 (包含所有必需字段)
     sqlite3 "$X3UI_DB" "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$escaped_remark', 1, 0, '$listen_ip', $port, 'socks', '$settings', '$stream_settings', '$unique_tag', '$sniffing', '$allocate');"
     
-    log_info "SOCKS5已添加: $listen_ip:$port (用户: $username)"
+    log_info "SOCKS5已添加: $listen_ip:$port (用户: $username, UDP: $enable_udp)"
 }
 
 #================================================
@@ -493,8 +514,8 @@ add_single_proxy() {
             echo -e "${BLUE}=== Shadowsocks配置 ===${NC}"
             read -p "请输入端口 (留空使用随机端口 $port): " custom_port
             if [ -n "$custom_port" ] && [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-                if check_port_in_db "$custom_port"; then
-                    log_error "端口 $custom_port 已被使用"
+                if check_ip_port_exists "$selected_listen_ip" "$custom_port"; then
+                    log_error "代理已存在: $selected_listen_ip:$custom_port"
                     return
                 fi
                 port="$custom_port"
@@ -530,8 +551,8 @@ add_single_proxy() {
             echo -e "${BLUE}=== SOCKS5配置 ===${NC}"
             read -p "请输入端口 (留空使用随机端口 $port): " custom_port
             if [ -n "$custom_port" ] && [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-                if check_port_in_db "$custom_port"; then
-                    log_error "端口 $custom_port 已被使用"
+                if check_ip_port_exists "$selected_listen_ip" "$custom_port"; then
+                    log_error "代理已存在: $selected_listen_ip:$custom_port"
                     return
                 fi
                 port="$custom_port"
@@ -543,15 +564,26 @@ add_single_proxy() {
             read -p "请输入密码 (留空随机生成): " custom_password
             local password="${custom_password:-$(generate_password)}"
             
+            echo "是否启用UDP支持:"
+            echo "[1] 启用UDP (推荐)"
+            echo "[2] 禁用UDP"
+            read -p "请选择: " udp_choice
+            
+            local enable_udp=true
+            if [ "$udp_choice" = "2" ]; then
+                enable_udp=false
+            fi
+            
             read -p "请输入备注 (留空自动生成): " custom_remark
             remark="${custom_remark:-SOCKS5-$selected_listen_ip-$port}"
             
-            add_socks5_to_db "$selected_listen_ip" "$port" "$username" "$password" "$remark"
+            add_socks5_to_db "$selected_listen_ip" "$port" "$username" "$password" "$remark" "$enable_udp"
             
             echo -e "${GREEN}SOCKS5配置信息:${NC}"
             echo "监听地址: $selected_listen_ip:$port"
             echo "用户名: $username"
             echo "密码: $password"
+            echo "UDP支持: $enable_udp"
             echo "备注: $remark"
             ;;
         0) return ;;
@@ -581,9 +613,17 @@ batch_add_shared_proxies() {
     read -p "请输入统一监听端口 (留空则每个代理使用不同随机端口): " unified_port
     local unified_user=""
     local unified_pass=""
+    local enable_udp=true  # 默认开启UDP
     
     if [ "$proxy_type" = "2" ]; then
         read -p "请输入统一用户名 (留空则每个代理使用不同用户名): " unified_user
+        echo "是否为所有SOCKS5代理启用UDP支持:"
+        echo "[1] 启用UDP (推荐)"
+        echo "[2] 禁用UDP"
+        read -p "请选择: " udp_choice
+        if [ "$udp_choice" = "2" ]; then
+            enable_udp=false
+        fi
     fi
     read -p "请输入统一密码 (留空则每个代理使用不同密码): " unified_pass
 
@@ -602,17 +642,27 @@ batch_add_shared_proxies() {
             port=$(get_next_port)
         fi
 
+        # 检查IP和端口组合是否已存在
+        if check_ip_port_exists "$selected_listen_ip" "$port"; then
+            log_warn "代理已存在: $selected_listen_ip:$port，跳过第 $i 个代理。"
+            continue
+        fi
+
         if [ "$proxy_type" = "1" ]; then
             # Shadowsocks
             local password="${unified_pass:-$(generate_password)}"
             local remark="SS-Batch-$i-$selected_listen_ip-$port"
-            add_shadowsocks_to_db "$selected_listen_ip" "$port" "$password" "aes-256-gcm" "$remark"
+            if add_shadowsocks_to_db "$selected_listen_ip" "$port" "$password" "aes-256-gcm" "$remark"; then
+                log_info "第 $i 个Shadowsocks代理创建成功。"
+            fi
         elif [ "$proxy_type" = "2" ]; then
             # SOCKS5
             local username="${unified_user:-user_$i}"
             local password="${unified_pass:-$(generate_password)}"
             local remark="SOCKS5-Batch-$i-$selected_listen_ip-$port"
-            add_socks5_to_db "$selected_listen_ip" "$port" "$username" "$password" "$remark"
+            if add_socks5_to_db "$selected_listen_ip" "$port" "$username" "$password" "$remark" "$enable_udp"; then
+                log_info "第 $i 个SOCKS5代理创建成功。"
+            fi
         fi
 
         sleep 0.1
@@ -693,8 +743,16 @@ batch_add_exclusive_proxies() {
     fi
     
     local unified_user="" unified_pass=""
+    local enable_udp=true  # 默认开启UDP
     if [ "$proxy_type" = "2" ]; then 
         read -p "请输入统一用户名 (留空则每个代理使用不同用户名): " unified_user
+        echo "是否为所有SOCKS5代理启用UDP支持:"
+        echo "[1] 启用UDP (推荐)"
+        echo "[2] 禁用UDP"
+        read -p "请选择: " udp_choice
+        if [ "$udp_choice" = "2" ]; then
+            enable_udp=false
+        fi
     fi
     read -p "请输入统一密码 (留空则每个代理使用不同密码): " unified_pass
 
@@ -991,8 +1049,9 @@ show_proxy_details() {
         if [ -n "$settings" ]; then
             local username=$(echo "$settings" | grep -o '"user":"[^"]*"' | cut -d'"' -f4)
             local password=$(echo "$settings" | grep -o '"pass":"[^"]*"' | cut -d'"' -f4)
+            local udp_enabled=$(echo "$settings" | grep -o '"udp":[^,}]*' | cut -d':' -f2 | tr -d ' ')
             
-            echo "ID: $id | 监听: $listen:$port | 用户: $username | 密码: $password | 备注: $remark"
+            echo "ID: $id | 监听: $listen:$port | 用户: $username | 密码: $password | UDP: $udp_enabled | 备注: $remark"
         fi
     done
 }
@@ -1243,11 +1302,15 @@ modify_proxy() {
         local final_password="${new_password:-$current_password}"
         local final_remark="${new_remark:-$current_remark}"
         
-        # 检查新端口是否冲突
-        if [ -n "$new_port" ] && [ "$new_port" != "$current_port" ]; then
-            if check_port_in_db "$new_port"; then
-                log_error "端口 $new_port 已被使用"
-                return
+        # 检查新IP和端口组合是否冲突
+        if [ -n "$new_listen$new_port" ]; then
+            local check_listen="${new_listen:-$current_listen}"
+            local check_port="${new_port:-$current_port}"
+            if [ "$check_listen:$check_port" != "$current_listen:$current_port" ]; then
+                if check_ip_port_exists "$check_listen" "$check_port"; then
+                    log_error "代理已存在: $check_listen:$check_port"
+                    return
+                fi
             fi
         fi
         
@@ -1284,11 +1347,15 @@ modify_proxy() {
         local final_password="${new_password:-$current_password}"
         local final_remark="${new_remark:-$current_remark}"
         
-        # 检查新端口是否冲突
-        if [ -n "$new_port" ] && [ "$new_port" != "$current_port" ]; then
-            if check_port_in_db "$new_port"; then
-                log_error "端口 $new_port 已被使用"
-                return
+        # 检查新IP和端口组合是否冲突
+        if [ -n "$new_listen$new_port" ]; then
+            local check_listen="${new_listen:-$current_listen}"
+            local check_port="${new_port:-$current_port}"
+            if [ "$check_listen:$check_port" != "$current_listen:$current_port" ]; then
+                if check_ip_port_exists "$check_listen" "$check_port"; then
+                    log_error "代理已存在: $check_listen:$check_port"
+                    return
+                fi
             fi
         fi
         
