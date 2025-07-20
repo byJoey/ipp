@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #================================================
-# 3x-ui代理管理脚本 1 (基于3x-ui数据库)
+# 3x-ui代理管理脚本  (基于3x-ui数据库)
 # 功能：管理3x-ui代理服务器配置
 # 支持：Shadowsocks和SOCKS5协议
 # 基于3x-ui数据库操作，完全兼容3x-ui格式
@@ -68,16 +68,38 @@ generate_user_id() {
 # 服务管理函数
 #================================================
 
-# 重启3x-ui服务
-restart_x3ui() {
-    log_info "正在重启3x-ui服务..."
+# 重启3x-ui和xray服务
+restart_services() {
+    log_info "正在重启服务..."
+    
+    # 重启3x-ui服务
     if systemctl is-active --quiet "$X3UI_SERVICE"; then
         sudo systemctl restart "$X3UI_SERVICE"
-        sleep 2
-        log_info "3x-ui服务已成功重启。"
+        log_info "3x-ui服务已重启。"
     else
-        log_warn "3x-ui服务未在运行。请手动启动它。"
+        log_warn "3x-ui服务未在运行。正在尝试启动..."
+        sudo systemctl start "$X3UI_SERVICE"
     fi
+    
+    sleep 2
+    
+    # 重启xray服务
+    if systemctl is-active --quiet "xray"; then
+        sudo systemctl restart "xray"
+        log_info "xray服务已重启。"
+    elif command -v xray > /dev/null 2>&1; then
+        log_warn "xray服务未在运行，但xray程序存在。正在尝试启动..."
+        sudo systemctl start "xray" 2>/dev/null || log_warn "无法启动xray服务，可能由3x-ui管理。"
+    else
+        log_info "xray服务由3x-ui管理，无需单独重启。"
+    fi
+    
+    log_info "服务重启完成。"
+}
+
+# 重启3x-ui服务（保持向后兼容）
+restart_x3ui() {
+    restart_services
 }
 
 # 清理错误的数据库记录
@@ -125,7 +147,7 @@ clean_broken_records() {
     sqlite3 "$X3UI_DB" "UPDATE inbounds SET allocate = '{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":3}' WHERE (allocate IS NULL OR allocate = '') AND protocol IN ('shadowsocks', 'socks');"
     
     log_info "清理和修复完成。"
-    restart_x3ui
+    restart_services
 }
 
 # 修复数据库中的数据格式问题
@@ -183,7 +205,7 @@ EOF
     fi
 
     log_info "数据库格式修复完成。"
-    restart_x3ui
+    restart_services
 }
 
 # 检查依赖
@@ -1307,7 +1329,7 @@ main_menu() {
         echo -e "${RED}[13] 清空所有代理${NC}"
         echo "-------------------------------------"
         echo "[14] 查看备份"
-        echo "[15] 重启3x-ui服务"
+        echo "[15] 重启3x-ui和xray服务"
         echo "[16] 修复数据库格式问题"
         echo "[17] 清理错误的数据库记录"
         echo "[0] 退出"
@@ -1330,7 +1352,7 @@ main_menu() {
             12) batch_delete_proxies_by_port ;;
             13) clear_all_proxies ;;
             14) ls -la "$BACKUP_DIR" ;;
-            15) restart_x3ui ;;
+            15) restart_services ;;
             16) fix_database_format ;;
             17) clean_broken_records ;;
             0) log_info "正在退出"; exit 0 ;;
