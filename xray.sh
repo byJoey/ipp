@@ -1570,7 +1570,7 @@ batch_delete_proxies_by_remark() {
         return
     fi
 
-    # 获取所有唯一的备注
+    # 获取所有唯一的备注前缀（提取前缀部分）
     local unique_remarks=$(sqlite3 "$X3UI_DB" "SELECT DISTINCT remark FROM inbounds WHERE protocol IN ('shadowsocks', 'socks') AND remark IS NOT NULL AND remark != '' ORDER BY remark;" 2>/dev/null)
 
     if [ -z "$unique_remarks" ]; then 
@@ -1578,21 +1578,41 @@ batch_delete_proxies_by_remark() {
         return
     fi
 
-    echo -e "${YELLOW}请选择要删除的备注:${NC}"
-    local i=1
-    local remarks=()
-    
+    # 提取备注前缀（去掉序号和IP端口部分）
+    local prefix_remarks=()
     while IFS= read -r remark; do
         if [ -n "$remark" ]; then
-            echo "[$i] $remark"
-            remarks+=("$remark")
-            ((i++))
+            # 提取前缀部分（去掉最后的-数字-IP-端口）
+            local prefix=$(echo "$remark" | sed 's/-[0-9]*-[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}-[0-9]*$//')
+            if [ -n "$prefix" ]; then
+                prefix_remarks+=("$prefix")
+            fi
         fi
     done <<< "$unique_remarks"
+
+    # 去重并排序
+    local unique_prefixes=($(printf "%s\n" "${prefix_remarks[@]}" | sort -u))
+
+    if [ ${#unique_prefixes[@]} -eq 0 ]; then 
+        log_warn "没有找到有效的备注前缀。"
+        return
+    fi
+
+    echo -e "${YELLOW}请选择要删除的备注前缀:${NC}"
+    local i=1
+    local prefixes=()
+    
+    for prefix in "${unique_prefixes[@]}"; do
+        # 计算该前缀下的代理数量
+        local proxy_count=$(sqlite3 "$X3UI_DB" "SELECT COUNT(*) FROM inbounds WHERE remark LIKE '$prefix-%' AND protocol IN ('shadowsocks', 'socks');" 2>/dev/null || echo "0")
+        echo "[$i] $prefix (${proxy_count} 个代理)"
+        prefixes+=("$prefix")
+        ((i++))
+    done
     echo "[0] 返回主菜单"
 
     read -p "请输入选项: " choice
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#remarks[@]} ]; then 
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#prefixes[@]} ]; then 
         log_error "无效的选择。"
         return
     fi
@@ -1602,18 +1622,18 @@ batch_delete_proxies_by_remark() {
         return
     fi
 
-    local selected_remark="${remarks[$((choice - 1))]}"
+    local selected_prefix="${prefixes[$((choice - 1))]}"
     
-    # 查找匹配备注的代理
-    local matching_proxies=$(sqlite3 "$X3UI_DB" "SELECT id, protocol, listen, port, remark FROM inbounds WHERE remark = '$selected_remark' AND protocol IN ('shadowsocks', 'socks');")
+    # 查找匹配前缀的代理
+    local matching_proxies=$(sqlite3 "$X3UI_DB" "SELECT id, protocol, listen, port, remark FROM inbounds WHERE remark LIKE '$selected_prefix-%' AND protocol IN ('shadowsocks', 'socks');")
 
     if [ -z "$matching_proxies" ]; then 
-        log_warn "没有找到备注为 '${selected_remark}' 的代理。"
+        log_warn "没有找到备注前缀为 '${selected_prefix}' 的代理。"
         return
     fi
 
     local num=$(echo "$matching_proxies" | wc -l)
-    echo -e "${YELLOW}以下 ${num} 个备注为 '${selected_remark}' 的代理将被删除:${NC}"
+    echo -e "${YELLOW}以下 ${num} 个备注前缀为 '${selected_prefix}' 的代理将被删除:${NC}"
     while IFS='|' read -r id protocol listen port remark; do
         echo " - 协议: $protocol, 监听: $listen:$port, 备注: $remark"
     done <<< "$matching_proxies"
@@ -1628,7 +1648,7 @@ batch_delete_proxies_by_remark() {
     backup_database
 
     log_info "正在批量删除 ${num} 个代理..."
-    sqlite3 "$X3UI_DB" "DELETE FROM inbounds WHERE remark = '$selected_remark' AND protocol IN ('shadowsocks', 'socks');"
+    sqlite3 "$X3UI_DB" "DELETE FROM inbounds WHERE remark LIKE '$selected_prefix-%' AND protocol IN ('shadowsocks', 'socks');"
 
     log_info "批量删除完成。"
     restart_x3ui
