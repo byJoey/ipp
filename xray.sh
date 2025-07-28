@@ -616,6 +616,16 @@ batch_add_with_temp_db() {
     fi
     read -p "请输入统一密码 (留空则每个代理使用不同密码): " unified_pass
 
+    # 添加备注输入（强制填写）
+    while true; do
+        read -p "请输入统一备注前缀 (必填): " unified_remark_prefix
+        if [ -n "$unified_remark_prefix" ]; then
+            break
+        else
+            log_error "备注前缀不能为空，请重新输入！"
+        fi
+    done
+
     log_info "开始在临时数据库中批量生成 $count 个代理..."
     local success_count=0
 
@@ -634,7 +644,7 @@ batch_add_with_temp_db() {
         if [ "$proxy_type" = "1" ]; then
             # Shadowsocks
             local password="${unified_pass:-$(generate_password)}"
-            local remark="SS-Batch-$i-$selected_listen_ip-$port"
+            local remark="${unified_remark_prefix}-$i-$selected_listen_ip-$port"
             if add_shadowsocks_to_temp_db "$selected_listen_ip" "$port" "$password" "aes-256-gcm" "$remark"; then
                 ((success_count++))
             fi
@@ -642,7 +652,7 @@ batch_add_with_temp_db() {
             # SOCKS5
             local username="${unified_user:-user_$i}"
             local password="${unified_pass:-$(generate_password)}"
-            local remark="SOCKS5-Batch-$i-$selected_listen_ip-$port"
+            local remark="${unified_remark_prefix}-$i-$selected_listen_ip-$port"
             if add_socks5_to_temp_db "$selected_listen_ip" "$port" "$username" "$password" "$remark" "$enable_udp"; then
                 ((success_count++))
             fi
@@ -1168,6 +1178,16 @@ batch_add_shared_proxies() {
     fi
     read -p "请输入统一密码 (留空则每个代理使用不同密码): " unified_pass
 
+    # 添加备注输入（强制填写）
+    while true; do
+        read -p "请输入统一备注前缀 (必填): " unified_remark_prefix
+        if [ -n "$unified_remark_prefix" ]; then
+            break
+        else
+            log_error "备注前缀不能为空，请重新输入！"
+        fi
+    done
+
     if ! show_local_ip_menu; then 
         return
     fi
@@ -1192,7 +1212,7 @@ batch_add_shared_proxies() {
         if [ "$proxy_type" = "1" ]; then
             # Shadowsocks
             local password="${unified_pass:-$(generate_password)}"
-            local remark="SS-Batch-$i-$selected_listen_ip-$port"
+            local remark="${unified_remark_prefix}-$i-$selected_listen_ip-$port"
             if add_shadowsocks_to_db "$selected_listen_ip" "$port" "$password" "aes-256-gcm" "$remark"; then
                 log_info "第 $i 个Shadowsocks代理创建成功。"
             fi
@@ -1200,7 +1220,7 @@ batch_add_shared_proxies() {
             # SOCKS5
             local username="${unified_user:-user_$i}"
             local password="${unified_pass:-$(generate_password)}"
-            local remark="SOCKS5-Batch-$i-$selected_listen_ip-$port"
+            local remark="${unified_remark_prefix}-$i-$selected_listen_ip-$port"
             if add_socks5_to_db "$selected_listen_ip" "$port" "$username" "$password" "$remark" "$enable_udp"; then
                 log_info "第 $i 个SOCKS5代理创建成功。"
             fi
@@ -1297,6 +1317,16 @@ batch_add_exclusive_proxies() {
     fi
     read -p "请输入统一密码 (留空则每个代理使用不同密码): " unified_pass
 
+    # 添加备注输入（强制填写）
+    while true; do
+        read -p "请输入统一备注前缀 (必填): " unified_remark_prefix
+        if [ -n "$unified_remark_prefix" ]; then
+            break
+        else
+            log_error "备注前缀不能为空，请重新输入！"
+        fi
+    done
+
     echo -e "${YELLOW}即将为以下 ${num_to_process} 个IP地址创建独享代理:${NC}"
     printf " %s\n" "${ips_to_process[@]}"
     echo "所有代理将监听在端口: ${unified_port}"
@@ -1320,7 +1350,7 @@ batch_add_exclusive_proxies() {
             else 
                 password=$(generate_password)
             fi
-            local remark="SS-Exclusive-$((i+1))-$listen_ip-$port"
+            local remark="${unified_remark_prefix}-$((i+1))-$listen_ip-$port"
             add_shadowsocks_to_db "$listen_ip" "$port" "$password" "aes-256-gcm" "$remark"
         elif [ "$proxy_type" = "2" ]; then
             local username password
@@ -1334,7 +1364,7 @@ batch_add_exclusive_proxies() {
             else 
                 password=$(generate_password)
             fi
-            local remark="SOCKS5-Exclusive-$((i+1))-$listen_ip-$port"
+            local remark="${unified_remark_prefix}-$((i+1))-$listen_ip-$port"
             add_socks5_to_db "$listen_ip" "$port" "$username" "$password" "$remark"
         fi
 
@@ -1465,22 +1495,52 @@ batch_delete_proxies_by_port() {
         return
     fi
 
-    read -p "请输入要删除的代理所使用的端口号: " port
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then 
-        log_error "无效的端口号。"
+    # 获取所有使用的端口
+    local used_ports=$(sqlite3 "$X3UI_DB" "SELECT DISTINCT port FROM inbounds WHERE protocol IN ('shadowsocks', 'socks') ORDER BY port;" 2>/dev/null)
+
+    if [ -z "$used_ports" ]; then 
+        log_warn "没有找到任何代理端口。"
         return
     fi
 
+    echo -e "${YELLOW}请选择要删除的端口:${NC}"
+    local i=1
+    local ports=()
+    
+    while IFS= read -r port; do
+        if [ -n "$port" ]; then
+            # 获取该端口上的代理数量
+            local proxy_count=$(sqlite3 "$X3UI_DB" "SELECT COUNT(*) FROM inbounds WHERE port = $port AND protocol IN ('shadowsocks', 'socks');" 2>/dev/null || echo "0")
+            echo "[$i] 端口 $port (${proxy_count} 个代理)"
+            ports+=("$port")
+            ((i++))
+        fi
+    done <<< "$used_ports"
+    echo "[0] 返回主菜单"
+
+    read -p "请输入选项: " choice
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#ports[@]} ]; then 
+        log_error "无效的选择。"
+        return
+    fi
+
+    if [ "$choice" -eq 0 ]; then 
+        log_info "操作取消。"
+        return
+    fi
+
+    local selected_port="${ports[$((choice - 1))]}"
+    
     # 查找使用该端口的代理
-    local matching_proxies=$(sqlite3 "$X3UI_DB" "SELECT id, protocol, listen, remark FROM inbounds WHERE port = $port AND protocol IN ('shadowsocks', 'socks');")
+    local matching_proxies=$(sqlite3 "$X3UI_DB" "SELECT id, protocol, listen, remark FROM inbounds WHERE port = $selected_port AND protocol IN ('shadowsocks', 'socks');")
 
     if [ -z "$matching_proxies" ]; then 
-        log_warn "没有找到在端口 ${port} 上运行的代理。"
+        log_warn "没有找到在端口 ${selected_port} 上运行的代理。"
         return
     fi
 
     local num=$(echo "$matching_proxies" | wc -l)
-    echo -e "${YELLOW}以下 ${num} 个在端口 ${port} 上的代理将被删除:${NC}"
+    echo -e "${YELLOW}以下 ${num} 个在端口 ${selected_port} 上的代理将被删除:${NC}"
     while IFS='|' read -r id protocol listen remark; do
         echo " - 协议: $protocol, 监听IP: $listen, 备注: $remark"
     done <<< "$matching_proxies"
@@ -1495,7 +1555,80 @@ batch_delete_proxies_by_port() {
     backup_database
 
     log_info "正在批量删除 ${num} 个代理..."
-    sqlite3 "$X3UI_DB" "DELETE FROM inbounds WHERE port = $port AND protocol IN ('shadowsocks', 'socks');"
+    sqlite3 "$X3UI_DB" "DELETE FROM inbounds WHERE port = $selected_port AND protocol IN ('shadowsocks', 'socks');"
+
+    log_info "批量删除完成。"
+    restart_x3ui
+}
+
+# 按备注批量删除代理
+batch_delete_proxies_by_remark() {
+    echo -e "${BLUE}=== 按备注批量删除代理 ===${NC}"
+    
+    if [ ! -f "$X3UI_DB" ]; then 
+        log_error "3x-ui数据库不存在。"
+        return
+    fi
+
+    # 获取所有唯一的备注
+    local unique_remarks=$(sqlite3 "$X3UI_DB" "SELECT DISTINCT remark FROM inbounds WHERE protocol IN ('shadowsocks', 'socks') AND remark IS NOT NULL AND remark != '' ORDER BY remark;" 2>/dev/null)
+
+    if [ -z "$unique_remarks" ]; then 
+        log_warn "没有找到任何代理备注。"
+        return
+    fi
+
+    echo -e "${YELLOW}请选择要删除的备注:${NC}"
+    local i=1
+    local remarks=()
+    
+    while IFS= read -r remark; do
+        if [ -n "$remark" ]; then
+            echo "[$i] $remark"
+            remarks+=("$remark")
+            ((i++))
+        fi
+    done <<< "$unique_remarks"
+    echo "[0] 返回主菜单"
+
+    read -p "请输入选项: " choice
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#remarks[@]} ]; then 
+        log_error "无效的选择。"
+        return
+    fi
+
+    if [ "$choice" -eq 0 ]; then 
+        log_info "操作取消。"
+        return
+    fi
+
+    local selected_remark="${remarks[$((choice - 1))]}"
+    
+    # 查找匹配备注的代理
+    local matching_proxies=$(sqlite3 "$X3UI_DB" "SELECT id, protocol, listen, port, remark FROM inbounds WHERE remark = '$selected_remark' AND protocol IN ('shadowsocks', 'socks');")
+
+    if [ -z "$matching_proxies" ]; then 
+        log_warn "没有找到备注为 '${selected_remark}' 的代理。"
+        return
+    fi
+
+    local num=$(echo "$matching_proxies" | wc -l)
+    echo -e "${YELLOW}以下 ${num} 个备注为 '${selected_remark}' 的代理将被删除:${NC}"
+    while IFS='|' read -r id protocol listen port remark; do
+        echo " - 协议: $protocol, 监听: $listen:$port, 备注: $remark"
+    done <<< "$matching_proxies"
+    echo
+
+    read -p "您确定要全部删除吗? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then 
+        log_info "操作已取消。"
+        return
+    fi
+
+    backup_database
+
+    log_info "正在批量删除 ${num} 个代理..."
+    sqlite3 "$X3UI_DB" "DELETE FROM inbounds WHERE remark = '$selected_remark' AND protocol IN ('shadowsocks', 'socks');"
 
     log_info "批量删除完成。"
     restart_x3ui
@@ -1934,13 +2067,14 @@ main_menu() {
         echo -e "${RED}[10] 删除单个代理${NC}"
         echo -e "${RED}[11] 按用户名批量删除SOCKS5代理${NC}"
         echo -e "${RED}[12] 按端口批量删除代理${NC}"
-        echo -e "${RED}[13] 清空所有代理${NC}"
+        echo -e "${RED}[13] 按备注批量删除代理${NC}"
+        echo -e "${RED}[14] 清空所有代理${NC}"
         echo "-------------------------------------"
-        echo "[14] 查看备份"
-        echo "[15] 重启3x-ui和xray服务"
-        echo "[16] 修复数据库格式问题"
-        echo "[17] 清理错误的数据库记录"
-        echo "[18] 修复数据库锁定问题"
+        echo "[15] 查看备份"
+        echo "[16] 重启3x-ui和xray服务"
+        echo "[17] 修复数据库格式问题"
+        echo "[18] 清理错误的数据库记录"
+        echo "[19] 修复数据库锁定问题"
         echo "[0] 退出"
         echo
 
@@ -1959,12 +2093,13 @@ main_menu() {
             10) delete_single_proxy ;;
             11) batch_delete_proxies_by_user ;;
             12) batch_delete_proxies_by_port ;;
-            13) clear_all_proxies ;;
-            14) ls -la "$BACKUP_DIR" ;;
-            15) restart_services ;;
-            16) fix_database_format ;;
-            17) clean_broken_records ;;
-            18) fix_database_lock ;;
+            13) batch_delete_proxies_by_remark ;;
+            14) clear_all_proxies ;;
+            15) ls -la "$BACKUP_DIR" ;;
+            16) restart_services ;;
+            17) fix_database_format ;;
+            18) clean_broken_records ;;
+            19) fix_database_lock ;;
             0) log_info "正在退出"; exit 0 ;;
             *) log_error "无效的选择" ;;
         esac
